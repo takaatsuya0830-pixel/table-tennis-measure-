@@ -11,7 +11,8 @@ CSV列:
   color_x, color_y, color_r,   ← 未検出は空欄
   num_hough, num_color
 
-複数検出時は半径が最大の円（最も信頼度が高い）を採用。
+複数検出時は「前フレームで採用したボール位置に最も近い円」を採用（前フレーム追従方式）。
+最初の検出フレームまたは直前が見失い状態のときは最大円で初期化。
 両手法の結果を別列に保存するので、後で比較可能。
 
 使い方:
@@ -20,6 +21,7 @@ CSV列:
   python detect_ball.py --ball orange            # オレンジボール
   python detect_ball.py --fps 247                # 実効fps上書き
   python detect_ball.py --save-every 30          # 画像保存間隔（デフォルト10）
+  python detect_ball.py --max-jump 200           # 追従最大距離px（デフォルト150）
 """
 
 import argparse
@@ -163,6 +165,32 @@ def largest(
     return max(circles, key=lambda c: c[2])
 
 
+def nearest(
+    circles: list[tuple[int, int, int]],
+    prev_x: int,
+    prev_y: int,
+    max_jump: float,
+) -> tuple[int, int, int] | None:
+    """前フレーム位置(prev_x, prev_y)に最も近い円を返す。
+    全候補が max_jump を超える場合は None（見失い）を返す。"""
+    if not circles:
+        return None
+    best = min(circles, key=lambda c: (c[0] - prev_x) ** 2 + (c[1] - prev_y) ** 2)
+    dist = ((best[0] - prev_x) ** 2 + (best[1] - prev_y) ** 2) ** 0.5
+    return best if dist <= max_jump else None
+
+
+def pick(
+    circles: list[tuple[int, int, int]],
+    prev: tuple[int, int, int] | None,
+    max_jump: float,
+) -> tuple[int, int, int] | None:
+    """追従方式で採用円を選ぶ。prev=None なら最大円で初期化。"""
+    if prev is None:
+        return largest(circles)
+    return nearest(circles, prev[0], prev[1], max_jump)
+
+
 def draw_detections(
     frame: np.ndarray,
     hough: list,
@@ -229,6 +257,10 @@ def main():
         "--param2", type=int, default=HOUGH_PARAM2,
         help=f"HoughCircles param2（小さいほど感度UP、デフォルト: {HOUGH_PARAM2}）",
     )
+    parser.add_argument(
+        "--max-jump", type=float, default=150.0,
+        help="前フレームからの最大追従距離px。超えると見失い扱い（デフォルト: 150）",
+    )
     args = parser.parse_args()
 
     roi = tuple(args.roi) if args.roi else None
@@ -265,12 +297,15 @@ def main():
     if roi:
         print(f"ROI        : x={roi[0]}-{roi[2]}  y={roi[1]}-{roi[3]}")
     print(f"半径範囲   : {args.min_r} 〜 {args.max_r} px")
+    print(f"最大追従距離: {args.max_jump} px")
     print(f"処理範囲   : フレーム {args.start} 〜 {args.start + process_count - 1}")
     print(f"CSV出力    : {csv_path.name}")
     print()
 
     hough_hits = 0
     color_hits = 0
+    prev_hough: tuple[int, int, int] | None = None
+    prev_color: tuple[int, int, int] | None = None
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -302,9 +337,11 @@ def main():
                 min_r=args.min_r, max_r=args.max_r,
             )
 
-            # 複数検出時は最大円を採用
-            hb = largest(hough_all)
-            cb = largest(color_all)
+            # 前フレーム追従方式で採用円を選択
+            hb = pick(hough_all, prev_hough, args.max_jump)
+            cb = pick(color_all, prev_color, args.max_jump)
+            prev_hough = hb
+            prev_color = cb
 
             writer.writerow([
                 frame_idx,
