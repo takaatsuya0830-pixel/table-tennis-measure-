@@ -288,6 +288,9 @@ def main():
     detect_dir = OUTPUT_DIR / "detections"
     detect_dir.mkdir(parents=True, exist_ok=True)
 
+    frame_dir = detect_dir / video_path.stem
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = detect_dir / f"detections_{timestamp}.csv"
 
@@ -366,7 +369,7 @@ def main():
                 vis = draw_detections(
                     frame, hough_all, color_all, frame_idx, time_sec, roi
                 )
-                imwrite(detect_dir / f"frame_{frame_idx:05d}.png", vis)
+                imwrite(frame_dir / f"frame_{frame_idx:05d}.png", vis)
 
             if i % 50 == 0:
                 pct = i / process_count * 100
