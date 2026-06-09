@@ -48,7 +48,7 @@ VIDEO_PATH = Path(
 )
 OUTPUT_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\frames")
 
-EFFECTIVE_FPS = 233  # 実効fps（校正値が変わったらここを変更）
+EFFECTIVE_FPS = 240  # 実効fps: 撮影メタデータ com.android.capture.fps=240 より確定(旧233は誤り)
 
 # Hough円検出パラメータ
 # ボールが画面内で直径30〜100px程度になる距離を想定

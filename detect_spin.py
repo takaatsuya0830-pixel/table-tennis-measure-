@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ─── 定数 ────────────────────────────────────────────────────
-EFFECTIVE_FPS = 233
+EFFECTIVE_FPS = 240  # 撮影メタデータ com.android.capture.fps=240 より確定(旧233は誤り)
 
 OUTPUT_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\frames")
 # ─────────────────────────────────────────────────────────────
