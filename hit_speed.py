@@ -1,0 +1,220 @@
+"""
+打球速度 計測スクリプト  ── 2026-06-23
+
+打った/投げた卓球ボールが飛ぶ動画から、飛球の速度(m/s, km/h)を算出する。
+
+手法:
+  1. 各フレームで白球を検出（HSVで低彩度・高輝度 → 肌色の手は彩度が高く自動除外）
+  2. 検出が連続する最長区間（=1回の飛行）を切り出し、半径の外れ値(ブラーで潰れた点)を除去
+  3. ボール直径(既知40mm)による自己校正で px→cm（飛球面の局所スケール、定規不要）
+  4. 座標を主運動軸へ射影(PCA)し、進行距離 s(t) を直線(等速)フィット → 速度
+     ※飛行は0.1秒程度で空気抵抗は小さく、ほぼ等速。区間ごとの速度範囲も併記
+
+使い方:
+  python hit_speed.py --video PXL_20260623_064552307.mp4
+  python hit_speed.py --video <path> --v-low 150 --s-high 60   # 白球HSV閾値の調整
+  python hit_speed.py --video <path> --f-start 555 --f-end 590  # 区間を手動指定
+
+【限界】1台のカメラでは奥行き方向の速度は測れない。飛球線に対しカメラを
+垂直（球が画面を横切る）に置くこと。回転(スピン)は別計測（240fpsは120rpsまで）。
+"""
+
+import argparse
+import csv
+import io
+import sys
+from pathlib import Path
+
+import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+EFFECTIVE_FPS = 240.0          # capture.fps メタデータより
+BALL_DIAM_CM = 4.0             # 卓球ボール直径 40mm
+VIDEO_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\videos")
+OUT_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\frames\hit_speed")
+
+
+def imwrite(path, img):
+    ok, buf = cv2.imencode(".png", img)
+    if ok:
+        open(str(path), "wb").write(buf.tobytes())
+
+
+def detect_white_ball(frame, v_low, s_high, r_min, r_max, min_area):
+    """HSVで白球(低彩度・高輝度)を検出。最大の円形blobの(x,y,r)を返す。"""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    m = cv2.inRange(hsv, (0, 0, v_low), (180, s_high, 255))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if a < min_area:
+            continue
+        (x, y), r = cv2.minEnclosingCircle(c)
+        if r_min < r < r_max and a / (np.pi * r * r) > 0.55:
+            if best is None or a > best[0]:
+                best = (a, float(x), float(y), float(r))
+    return best[1:] if best else None
+
+
+def longest_run(frames, max_gap=6):
+    """フレーム番号リストから欠損 max_gap 以内で繋がる最長区間のインデックスを返す。"""
+    if not frames:
+        return []
+    runs = [[0]]
+    for i in range(1, len(frames)):
+        if frames[i] - frames[runs[-1][-1]] <= max_gap + 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    return max(runs, key=len)
+
+
+def robust_linear(t, s, n_iter=3, k=2.5):
+    """進行距離 s(t) を等速直線フィット(残差で外れ値除去)。slope[px/s], mask を返す。"""
+    mask = np.ones(len(t), bool)
+    A = np.vstack([t, np.ones_like(t)]).T
+    coef, *_ = np.linalg.lstsq(A[mask], s[mask], rcond=None)
+    for _ in range(n_iter):
+        resid = s - (A @ coef)
+        sd = resid[mask].std()
+        if sd == 0:
+            break
+        nm = np.abs(resid) <= k * sd
+        if nm.sum() == mask.sum() or nm.sum() < 4:
+            break
+        mask = nm
+        coef, *_ = np.linalg.lstsq(A[mask], s[mask], rcond=None)
+    return coef[0], coef, mask
+
+
+def main():
+    ap = argparse.ArgumentParser(description="打球速度 計測")
+    ap.add_argument("--video", required=True, help="動画ファイル（VIDEO_DIR相対 or フルパス）")
+    ap.add_argument("--fps", type=float, default=EFFECTIVE_FPS)
+    ap.add_argument("--v-low", type=int, default=160, help="白判定の最小輝度V(0-255)")
+    ap.add_argument("--s-high", type=int, default=55, help="白判定の最大彩度S(0-255、低いほど手・背景を除外)")
+    ap.add_argument("--r-min", type=int, default=8, help="ボール最小半径px")
+    ap.add_argument("--r-max", type=int, default=80, help="ボール最大半径px")
+    ap.add_argument("--min-area", type=int, default=100, help="検出最小面積px^2")
+    ap.add_argument("--f-start", type=int, default=None)
+    ap.add_argument("--f-end", type=int, default=None)
+    args = ap.parse_args()
+
+    path = Path(args.video)
+    if not path.is_absolute():
+        path = VIDEO_DIR / path
+    if not path.exists():
+        print(f"エラー: {path} が見つかりません")
+        sys.exit(1)
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        print("エラー: 動画を開けません")
+        sys.exit(1)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    f0 = args.f_start if args.f_start is not None else 0
+    f1 = args.f_end if args.f_end is not None else n - 1
+
+    F, X, Y, R = [], [], [], []
+    cap.set(cv2.CAP_PROP_POS_FRAMES, f0)
+    for fno in range(f0, f1 + 1):
+        ok, fr = cap.read()
+        if not ok:
+            break
+        d = detect_white_ball(fr, args.v_low, args.s_high, args.r_min, args.r_max, args.min_area)
+        if d:
+            F.append(fno); X.append(d[0]); Y.append(d[1]); R.append(d[2])
+    cap.release()
+
+    if len(F) < 4:
+        print(f"検出 {len(F)} 点で不足。--v-low を下げる/--s-high を上げる、")
+        print("または球が画面を横切る動画か確認してください。")
+        sys.exit(1)
+
+    F = np.array(F); X = np.array(X); Y = np.array(Y); R = np.array(R)
+    # 最長飛行区間
+    idx = longest_run(list(F))
+    F, X, Y, R = F[idx], X[idx], Y[idx], R[idx]
+
+    # 半径の外れ値除去(ブラーで潰れた点)→ 自己校正スケール
+    rmed0 = np.median(R)
+    keep = (R > 0.55 * rmed0) & (R < 1.8 * rmed0)
+    rmed = np.median(R[keep]) if keep.sum() >= 3 else rmed0
+    ppcm = 2 * rmed / BALL_DIAM_CM
+
+    # PCA主軸へ射影 → 進行距離[px]
+    pts = np.column_stack([X, Y])
+    c = pts.mean(0)
+    _, sv, vt = np.linalg.svd(pts - c, full_matrices=False)
+    s_px = (pts - c) @ vt[0]
+    if s_px[-1] < s_px[0]:
+        s_px = -s_px
+    linearity = sv[0] / sv[1] if sv[1] > 0 else float("inf")
+
+    t = (F - F[0]) / args.fps
+    slope_px, coef, mask = robust_linear(t, s_px)   # px/s
+    v_ms = abs(slope_px) / ppcm / 100.0
+    v_kmh = v_ms * 3.6
+
+    # 区間速度の範囲(参考)
+    seg = np.abs(np.diff(s_px)) / np.diff(t) / ppcm / 100.0
+    seg = seg[np.isfinite(seg)]
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"動画        : {path.name}")
+    print(f"fps         : {args.fps}")
+    print(f"検出/採用   : {len(F)} 点 / フィット {int(mask.sum())} 点")
+    print(f"軌跡直線性  : 主軸が副軸の {linearity:.1f} 倍")
+    print(f"ボール半径  : 中央値 {rmed:.0f}px → 直径 {2*rmed:.0f}px,  px/cm={ppcm:.1f}(自己校正)")
+    print(f"飛行時間    : {t[-1]*1000:.0f} ms")
+    print()
+    print(f"  ★ 打球速度 = {v_ms:.2f} m/s = {v_kmh:.1f} km/h  (等速フィット)")
+    if len(seg):
+        print(f"    区間速度の範囲: {seg.min()*3.6:.1f} 〜 {seg.max()*3.6:.1f} km/h")
+    if len(F) < 8:
+        print("  ⚠ 検出点が少なめ。明るく短露光・球が全幅を横切る撮影で精度↑")
+    if linearity < 4:
+        print("  ⚠ 軌跡が直線的でない（奥行き移動の可能性）。飛球線に垂直なカメラ位置を推奨")
+
+    # CSV
+    stem = path.stem
+    with open(OUT_DIR / f"{stem}_track.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["frame", "time_s", "x_px", "y_px", "r_px", "s_cm"])
+        for i in range(len(F)):
+            w.writerow([F[i], f"{t[i]:.5f}", f"{X[i]:.1f}", f"{Y[i]:.1f}",
+                        f"{R[i]:.1f}", f"{s_px[i]/ppcm:.2f}"])
+
+    # プロット
+    fig, ax = plt.subplots(2, 1, figsize=(9, 8))
+    ax[0].scatter(X[mask], Y[mask], s=20, c="steelblue", label="ball (used)")
+    if (~mask).any():
+        ax[0].scatter(X[~mask], Y[~mask], s=20, c="red", marker="x", label="outlier")
+    ax[0].invert_yaxis(); ax[0].set_aspect("equal", "box")
+    ax[0].set_xlabel("x [px]"); ax[0].set_ylabel("y [px]")
+    ax[0].set_title(f"Trajectory — {stem}  ({v_kmh:.1f} km/h)")
+    ax[0].legend(); ax[0].grid(alpha=0.3)
+    tf = np.linspace(t.min(), t.max(), 100)
+    ax[1].scatter(t, s_px / ppcm, s=20, c="steelblue")
+    ax[1].plot(tf, np.polyval(coef, tf) / ppcm, "r--",
+               label=f"{v_ms:.2f} m/s = {v_kmh:.1f} km/h")
+    ax[1].set_xlabel("time [s]"); ax[1].set_ylabel("distance [cm]")
+    ax[1].set_title("Distance vs time (constant-speed fit)")
+    ax[1].legend(); ax[1].grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(str(OUT_DIR / f"{stem}_speed.png"), dpi=140)
+    plt.close()
+    print(f"\n  出力: {OUT_DIR / (stem + '_speed.png')}")
+    print(f"        {OUT_DIR / (stem + '_track.csv')}")
+
+
+if __name__ == "__main__":
+    main()
