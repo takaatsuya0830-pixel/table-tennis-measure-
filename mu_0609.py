@@ -22,11 +22,34 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 FPS = 240.0
 G = 9.81
 BALL_DIAM_CM = 4.0
+# 減速フェーズとして採用する下限速度(ピーク速度に対する比)。
+# 停止直前の非等減速区間を除外し、検出器(古典/AI)によらず同じμrが出るようにする。
+DECEL_V_MIN = 0.15
 VDIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\videos")
 
 
 def parabola(t, s0, v0, a):
     return s0 + v0 * t - 0.5 * a * t * t
+
+
+def detect_track_ai(video_path, det_ai):
+    """AI(YOLOv8 ONNX)でボールを検出。古典版と同じ (F, X, Y, D) を返す。
+    D は「真の直径」で、AI枠は運動ブラーで横に伸びるため短辺 min(w,h) を採用
+    （古典版が minAreaRect 短辺を使うのと同じ理由）。"""
+    cap = cv2.VideoCapture(str(video_path))
+    F, X, Y, D = [], [], [], []
+    fno = 0
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        b = det_ai.detect_best(fr)
+        if b:
+            cx, cy, w, h, _ = b
+            F.append(fno); X.append(cx); Y.append(cy); D.append(min(w, h))
+        fno += 1
+    cap.release()
+    return np.array(F), np.array(X, float), np.array(Y, float), np.array(D, float)
 
 
 def detect_track(video_path):
@@ -82,8 +105,8 @@ def longest_run(F, max_gap=4):
     return max(runs, key=len)
 
 
-def process(video_path):
-    F, X, Y, D = detect_track(video_path)
+def process(video_path, det_ai=None):
+    F, X, Y, D = detect_track_ai(video_path, det_ai) if det_ai else detect_track(video_path)
     if len(F) < 20:
         return {"v": video_path.stem, "note": f"検出{len(F)}点で不足"}
     idx = longest_run(F)
@@ -99,13 +122,17 @@ def process(video_path):
     linearity = sv[0] / sv[1] if sv[1] > 0 else 999
 
     # 減速フェーズ抽出
+    # 停止直前は転がり抵抗が一定でなくなり(等減速の仮定が崩れ)、放物線フィットの
+    # 減速度を押し下げる。閾値0.02では停止間際まで含めてしまい、検出器が末尾を
+    # 多く拾うかどうかでμrが変わった(AI 0.073 vs 古典 0.085、窓を揃えれば一致)。
+    # DECEL_V_MIN=0.15 で等減速が成り立つ区間だけを使い、検出器に依存しなくする。
     t_all = (F - F[0]) / FPS
     sm = np.convolve(s_axis, np.ones(5) / 5, mode="same")
     v_inst = np.gradient(sm, t_all)
     kpk = int(np.argmax(v_inst))
     j = kpk; end = kpk; vmax = v_inst[kpk]
     while j < len(v_inst):
-        if v_inst[j] > 0.02 * vmax:
+        if v_inst[j] > DECEL_V_MIN * vmax:
             end = j; j += 1
         else:
             break
@@ -146,12 +173,26 @@ def process(video_path):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--detector", choices=["classical", "ai"], default="classical",
+                    help="ボール検出方式。ai=学習済みYOLOv8(ONNX)")
+    ap.add_argument("--onnx", default=None)
+    ap.add_argument("--ai-conf", type=float, default=0.25)
+    args = ap.parse_args()
+
+    det_ai = None
+    if args.detector == "ai":
+        from ai_detect import BallDetector, DEFAULT_ONNX
+        det_ai = BallDetector(args.onnx or DEFAULT_ONNX, conf=args.ai_conf)
+
     vids = sorted(glob.glob(str(VDIR / "PXL_20260609_*.mp4")))
+    print(f"検出方式: {'AI(YOLOv8 ONNX)' if det_ai else '古典CV(背景差分+輝度)'}")
     print(f"{'動画':<22}{'n':>4}{'径px':>6}{'v0[km/h]':>9}{'a[m/s²]':>9}{'μr':>8}{'±σ':>7}{'直線性':>7}{'RMS[mm]':>8}  判定")
     print("-" * 92)
     adopted = []
     for v in vids:
-        r = process(Path(v))
+        r = process(Path(v), det_ai)
         tag = Path(v).stem.replace("PXL_20260609_", "")
         if r.get("note") != "OK":
             print(f"{tag:<22}  {r.get('note','')}")

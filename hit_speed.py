@@ -106,6 +106,11 @@ def main():
     ap.add_argument("--min-area", type=int, default=100, help="検出最小面積px^2")
     ap.add_argument("--f-start", type=int, default=None)
     ap.add_argument("--f-end", type=int, default=None)
+    ap.add_argument("--detector", choices=["classical", "ai"], default="classical",
+                    help="ボール検出方式。ai=学習済みYOLOv8(ONNX)。"
+                         "打球では古典46%%に対しAI100%%と大幅に良好")
+    ap.add_argument("--onnx", default=None, help="AI検出のONNXパス(既定はai_detect.DEFAULT_ONNX)")
+    ap.add_argument("--ai-conf", type=float, default=0.25, help="AI検出の信頼度閾値")
     args = ap.parse_args()
 
     path = Path(args.video)
@@ -123,20 +128,33 @@ def main():
     f0 = args.f_start if args.f_start is not None else 0
     f1 = args.f_end if args.f_end is not None else n - 1
 
+    det_ai = None
+    if args.detector == "ai":
+        from ai_detect import BallDetector, DEFAULT_ONNX
+        det_ai = BallDetector(args.onnx or DEFAULT_ONNX, conf=args.ai_conf)
+
     F, X, Y, R = [], [], [], []
     cap.set(cv2.CAP_PROP_POS_FRAMES, f0)
     for fno in range(f0, f1 + 1):
         ok, fr = cap.read()
         if not ok:
             break
-        d = detect_white_ball(fr, args.v_low, args.s_high, args.r_min, args.r_max, args.min_area)
+        if det_ai is not None:
+            b = det_ai.detect_best(fr)      # (cx, cy, w, h, conf)
+            d = (b[0], b[1], (b[2] + b[3]) / 4.0) if b else None   # 半径=(w+h)/2/2
+        else:
+            d = detect_white_ball(fr, args.v_low, args.s_high,
+                                  args.r_min, args.r_max, args.min_area)
         if d:
             F.append(fno); X.append(d[0]); Y.append(d[1]); R.append(d[2])
     cap.release()
 
     if len(F) < 4:
-        print(f"検出 {len(F)} 点で不足。--v-low を下げる/--s-high を上げる、")
-        print("または球が画面を横切る動画か確認してください。")
+        print(f"検出 {len(F)} 点で不足。", end="")
+        if det_ai is not None:
+            print("--ai-conf を下げる(例 0.15)か、--detector classical を試してください。")
+        else:
+            print("--v-low を下げる/--s-high を上げる、または --detector ai を試してください。")
         sys.exit(1)
 
     F = np.array(F); X = np.array(X); Y = np.array(Y); R = np.array(R)
@@ -200,7 +218,8 @@ def main():
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"動画        : {path.name}")
-    print(f"fps         : {args.fps}")
+    print(f"fps         : {args.fps}   検出方式: "
+          f"{'AI(YOLOv8 ONNX)' if det_ai is not None else '古典CV(HSV白球)'}")
     print(f"検出/採用   : {len(F)} 点 / フィット {int(mask.sum())} 点")
     print(f"軌跡直線性  : 主軸が副軸の {linearity:.1f} 倍")
     print(f"ボール半径  : 中央値 {rmed:.0f}px → 直径 {2*rmed:.0f}px,  px/cm={ppcm:.1f}(自己校正)")

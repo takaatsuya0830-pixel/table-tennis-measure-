@@ -18,7 +18,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-DEFAULT_ONNX = Path(r"c:\Users\bi23043\Documents\4年前期\models\ball_yolov8.onnx")
+DEFAULT_ONNX = Path(r"c:\Users\bi23043\Documents\4年前期\models\ball_yolo8.onnx")
+
+# AI枠→実径の補正係数。
+# 学習ラベルを minEnclosingCircle(球に外接する円)から生成したため、AI枠は
+# 球の実径より系統的に大きい。μr斜め動画5本・96サンプルで実測した
+#   AI枠短辺 / 実径(面積等価径) = 1.098 ± 0.072 (中央値 1.111)
+# より k=0.90。位置(cx,cy)は正確なので径のみ補正する。
+# ※スケール(px/cm)に直結するため、μr(減速度)には敏感に効く。
+BOX_TO_DIAMETER = 0.90
 
 
 def letterbox(img, new=640, color=(114, 114, 114)):
@@ -35,17 +43,24 @@ def letterbox(img, new=640, color=(114, 114, 114)):
 
 
 class BallDetector:
-    def __init__(self, onnx_path=DEFAULT_ONNX, conf=0.25, iou=0.45, imgsz=640, ball_class=0):
+    def __init__(self, onnx_path=DEFAULT_ONNX, conf=0.25, iou=0.45, imgsz=640,
+                 ball_class=0, box_scale=BOX_TO_DIAMETER):
         onnx_path = Path(onnx_path)
         if not onnx_path.exists():
             raise FileNotFoundError(
                 f"ONNXモデルが見つかりません: {onnx_path}\n"
                 "Roboflowで学習→ONNX書き出し→このパスに置いてください。")
-        self.net = cv2.dnn.readNetFromONNX(str(onnx_path))
+        # 日本語パス対策: cv2.dnn はASCII外のパスを開けないため、バイト列から読み込む
+        try:
+            self.net = cv2.dnn.readNetFromONNX(str(onnx_path))
+        except cv2.error:
+            buf = np.fromfile(str(onnx_path), dtype=np.uint8)
+            self.net = cv2.dnn.readNetFromONNX(buf)
         self.conf = conf
         self.iou = iou
         self.imgsz = imgsz
         self.ball_class = ball_class
+        self.box_scale = box_scale     # 枠→実径の補正(位置は補正しない)
 
     def detect(self, frame):
         """frame からボール枠リスト [(cx,cy,w,h,conf)...] を原画素座標で返す。"""
@@ -80,7 +95,9 @@ class BallDetector:
         result = []
         for i in idxs:
             x, y, w, h = rects[i]
-            result.append((x + w / 2, y + h / 2, w, h, float(cf[i])))
+            # 中心は補正せず、径のみ box_scale で実径に補正
+            result.append((x + w / 2, y + h / 2,
+                           w * self.box_scale, h * self.box_scale, float(cf[i])))
         return result
 
     def detect_best(self, frame):
