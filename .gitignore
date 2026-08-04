@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+~$*.docx
+卒論/*.zip
+models/*.onnx
