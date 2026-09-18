@@ -35,6 +35,14 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 EFFECTIVE_FPS = 240.0          # capture.fps メタデータより
 BALL_DIAM_CM = 4.0             # 卓球ボール直径 40mm
+# ── 空気抵抗モデルの物理定数 ──
+# 卓球ボールは軽い(2.7g)ので飛行中の減速が大きい。抗力 F=½ρv²CdA より
+# 減速度 a = k·v²,  k = ρCdA/(2m)。20km/hでも0.1秒で約7%、60km/hでは約21%減速する。
+# 「等速フィット」は飛行中の平均速度を返すため、打球の初速を高速ほど過小評価する。
+BALL_MASS_KG = 0.0027
+AIR_DENSITY = 1.2              # kg/m^3
+DRAG_CD = 0.45                 # 球のCd(Re~1e4-1e5で0.4-0.5)
+G_CM = 981.0                   # cm/s^2
 VIDEO_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\videos")
 OUT_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\frames\hit_speed")
 
@@ -133,6 +141,39 @@ def robust_linear(t, s, n_iter=3, k=2.5):
         mask = nm
         coef, *_ = np.linalg.lstsq(A[mask], s[mask], rcond=None)
     return coef[0], coef, mask
+
+
+def drag_fit(t, s_cm, g_along_cm, k_cm):
+    """空気抵抗を考慮した飛行モデルで進行距離 s(t) をフィットし、初速 v0 を返す。
+
+    主軸方向の運動方程式:  dv/dt = g_along − k·v·|v|
+      g_along: 重力の主軸成分[cm/s^2](軌道が下向きなら正、上向きなら負)
+      k      : ρCdA/(2m) を cm 単位にしたもの[1/cm]
+    自由パラメータは s0 と v0 のみ(物理定数は既知)。
+    Returns dict(v0, s0, v_end, resid_rms) — v は cm/s。
+    """
+    from scipy.integrate import solve_ivp
+    from scipy.optimize import least_squares
+
+    def simulate(v0, s0):
+        def rhs(_t, y):
+            s, v = y
+            return [v, g_along_cm - k_cm * v * abs(v)]
+        sol = solve_ivp(rhs, (t[0], t[-1]), [s0, v0], t_eval=t, rtol=1e-8, atol=1e-8)
+        return sol.y[0], sol.y[1]
+
+    v_guess = (s_cm[-1] - s_cm[0]) / max(t[-1] - t[0], 1e-6)
+
+    def resid(p):
+        s_pred, _ = simulate(p[0], p[1])
+        return s_pred - s_cm
+
+    res = least_squares(resid, x0=[v_guess, s_cm[0]])
+    v0, s0 = res.x
+    s_pred, v_pred = simulate(v0, s0)
+    rms = float(np.sqrt(np.mean((s_pred - s_cm) ** 2)))
+    return {"v0": float(v0), "s0": float(s0), "v_end": float(v_pred[-1]),
+            "resid_rms": rms, "s_pred": s_pred, "v_pred": v_pred}
 
 
 def main():
@@ -266,9 +307,11 @@ def main():
     pts = np.column_stack([X, Y])
     c = pts.mean(0)
     _, sv, vt = np.linalg.svd(pts - c, full_matrices=False)
-    s_px = (pts - c) @ vt[0]
+    axis_u = vt[0].copy()
+    s_px = (pts - c) @ axis_u
     if s_px[-1] < s_px[0]:
         s_px = -s_px
+        axis_u = -axis_u          # 進行方向を正にした主軸の単位ベクトル
     linearity = sv[0] / sv[1] if sv[1] > 0 else float("inf")
 
     ppcm_mid = (ppcm_t[:-1] + ppcm_t[1:]) / 2
@@ -281,6 +324,24 @@ def main():
     # 区間速度の範囲(参考)
     seg = np.abs(np.diff(s_cm)) / np.diff(t) / 100.0
     seg = seg[np.isfinite(seg)]
+
+    # ── 空気抵抗モデルによる初速推定 ──
+    # 等速フィット(v_ms)は飛行中の「平均速度」。打球の初速 v0 を得るには
+    # 抗力 k·v² と重力の主軸成分で減速する運動方程式でフィットする。
+    area_m2 = np.pi * (BALL_DIAM_CM / 200.0) ** 2
+    k_m = AIR_DENSITY * DRAG_CD * area_m2 / (2 * BALL_MASS_KG)   # [1/m]
+    k_cm = k_m / 100.0                                              # [1/cm]
+    g_along = G_CM * axis_u[1]      # 画像y下向き=重力方向。主軸のy成分が重力の寄与
+    drag = None
+    try:
+        drag = drag_fit(t[mask], s_cm[mask], g_along, k_cm)
+    except Exception as e:      # フィット失敗時は等速結果のみ報告
+        drag_err = str(e)
+    # 比較用: 二次フィット(定加速度)から見かけの減速度
+    qcoef = np.polyfit(t[mask], s_cm[mask], 2)
+    a_quad = -2 * qcoef[0]          # cm/s^2 (正=減速)
+    v0_quad = qcoef[1]              # cm/s
+    a_drag_pred = k_cm * v0_quad ** 2 - g_along   # 抗力+重力が予測する減速度
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"動画        : {path.name}")
@@ -299,7 +360,22 @@ def main():
     print(f"飛行時間    : {t[-1]*1000:.0f} ms")
     print()
     _sname = "重力較正" if scale_src == "gravity" else "球径較正(局所スケール)"
-    print(f"  ★ 打球速度 = {v_ms:.2f} m/s = {v_kmh:.1f} km/h  (等速フィット・{_sname})")
+    if drag is not None:
+        v0_ms = drag["v0"] / 100.0
+        vend_ms = drag["v_end"] / 100.0
+        print(f"  ★ 打球初速 = {v0_ms:.2f} m/s = {v0_ms*3.6:.1f} km/h  (空気抵抗モデル・{_sname})")
+        print(f"    飛行終端 {vend_ms*3.6:.1f} km/h  /  平均(等速フィット) {v_kmh:.1f} km/h"
+              f"  /  減速 {(1-vend_ms/v0_ms)*100:.0f}%  残差RMS {drag['resid_rms']*10:.1f}mm")
+        # 抗力モデルの妥当性: 二次フィットの見かけ減速度 vs 物理予測
+        print(f"    減速度の検証: 実測 {a_quad/100:.2f} m/s²  vs 抗力+重力の予測 {a_drag_pred/100:.2f} m/s²"
+              f"  (Cd={DRAG_CD}, 重力の主軸成分 {g_along/100:+.2f} m/s²)")
+        print(f"    参考: 減速度を自由にした二次フィットの初速 = {v0_quad/100*3.6:.1f} km/h"
+              f"  (物理モデル {v0_ms*3.6:.1f} との差が「説明できない減速」の大きさ)")
+        if a_quad > 0 and abs(a_quad - a_drag_pred) / max(a_quad, 1e-6) > 0.5:
+            print("    ⚠ 実測減速が物理予測と50%超乖離。回転(マグヌス)や奥行き移動の可能性")
+    else:
+        print(f"  ★ 打球速度 = {v_ms:.2f} m/s = {v_kmh:.1f} km/h  (等速フィット・{_sname})")
+        print(f"    (空気抵抗モデルのフィットに失敗: {drag_err})")
     if len(seg):
         print(f"    区間速度の範囲: {seg.min()*3.6:.1f} 〜 {seg.max()*3.6:.1f} km/h")
     if ppcm_g is not None and scale_src != "gravity":
@@ -339,9 +415,12 @@ def main():
     tf = np.linspace(t.min(), t.max(), 100)
     ax[1].scatter(t, s_cm, s=20, c="steelblue")
     ax[1].plot(tf, np.polyval(coef, tf), "r--",
-               label=f"{v_ms:.2f} m/s = {v_kmh:.1f} km/h")
+               label=f"const-speed: {v_kmh:.1f} km/h (mean)")
+    if drag is not None:
+        ax[1].plot(t[mask], drag["s_pred"], "g-", linewidth=1.5,
+                   label=f"drag model: v0={drag['v0']/100*3.6:.1f} km/h, end={drag['v_end']/100*3.6:.1f}")
     ax[1].set_xlabel("time [s]"); ax[1].set_ylabel("distance [cm]")
-    ax[1].set_title("Distance vs time (constant-speed fit)")
+    ax[1].set_title("Distance vs time: constant-speed vs air-drag model")
     ax[1].legend(); ax[1].grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(str(OUT_DIR / f"{stem}_speed.png"), dpi=140)
