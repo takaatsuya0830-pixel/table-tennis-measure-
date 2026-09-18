@@ -18,7 +18,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-DEFAULT_ONNX = Path(r"c:\Users\bi23043\Documents\4年前期\models\ball_yolo8.onnx")
+# 近接1029枚 + 試合(BlurBall)2038枚 = 3067枚で学習したモデル。
+# 旧モデル(近接のみ)は models/ball_yolo8.onnx に残してある。
+DEFAULT_ONNX = Path(r"c:\Users\bi23043\Documents\4年前期\models\best.onnx")
 
 # AI枠→実径の補正係数。
 # 学習ラベルを minEnclosingCircle(球に外接する円)から生成したため、AI枠は

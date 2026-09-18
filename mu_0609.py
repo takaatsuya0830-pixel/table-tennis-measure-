@@ -25,6 +25,16 @@ BALL_DIAM_CM = 4.0
 # 減速フェーズとして採用する下限速度(ピーク速度に対する比)。
 # 停止直前の非等減速区間を除外し、検出器(古典/AI)によらず同じμrが出るようにする。
 DECEL_V_MIN = 0.15
+# 速度ピークから何秒間を減速フィットに使うか。検出器によって検出できる末尾の
+# 長さが違う(AIは古典より数フレーム長く追える)ため、比率でなく固定時間で窓を
+# 決めることで、どの検出器でも同じ物理区間をフィットする。
+# 6/9動画は減速窓が約0.5秒なので、共通して取れる長さとして0.45sを採用。
+DECEL_DURATION_S = 0.45
+# パース補正を適用する条件: 径の傾きのt値(|slope|/標準誤差)がこれ以上。
+# 径変化が小さい動画では傾きが測定ノイズで、補正するとμrが検出器依存になる
+# (古典0.086 vs AI0.068と21%差)。実測では7本中6本がt<3=ノイズだった。
+# t>=3 の動画だけ局所スケールを使い、それ以外は定数スケールにフォールバックする。
+PERSPECTIVE_T_MIN = 3.0
 VDIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\videos")
 
 
@@ -121,29 +131,42 @@ def process(video_path, det_ai=None):
         s_axis = -s_axis
     linearity = sv[0] / sv[1] if sv[1] > 0 else 999
 
-    # 減速フェーズ抽出
-    # 停止直前は転がり抵抗が一定でなくなり(等減速の仮定が崩れ)、放物線フィットの
-    # 減速度を押し下げる。閾値0.02では停止間際まで含めてしまい、検出器が末尾を
-    # 多く拾うかどうかでμrが変わった(AI 0.073 vs 古典 0.085、窓を揃えれば一致)。
-    # DECEL_V_MIN=0.15 で等減速が成り立つ区間だけを使い、検出器に依存しなくする。
+    # 減速フェーズ抽出（検出器非依存の物理基準で窓を決める）
+    # 停止直前は転がり抵抗が一定でなくなり等減速の仮定が崩れる。
+    # 「vmaxに対する比」で終端を決めると、より広く検出できる検出器(AI)ほど
+    # 遅い区間まで含んでしまい、μrが検出器依存になった(古典0.082 vs AI0.064)。
+    # → 終端は「速度ピークからの経過時間 DECEL_DURATION_S」で決める。
+    #   撮影fpsも減速の物理も検出器と無関係なので、同じ区間が選ばれる。
     t_all = (F - F[0]) / FPS
     sm = np.convolve(s_axis, np.ones(5) / 5, mode="same")
     v_inst = np.gradient(sm, t_all)
     kpk = int(np.argmax(v_inst))
-    j = kpk; end = kpk; vmax = v_inst[kpk]
-    while j < len(v_inst):
-        if v_inst[j] > DECEL_V_MIN * vmax:
-            end = j; j += 1
-        else:
+    vmax = v_inst[kpk]
+    t_end = t_all[kpk] + DECEL_DURATION_S
+    end = kpk
+    for j in range(kpk, len(t_all)):
+        if t_all[j] > t_end:
             break
+        if v_inst[j] <= DECEL_V_MIN * vmax:   # 事実上停止したら打ち切り
+            break
+        end = j
     lo, hi = kpk, max(end, kpk + 1)
     if hi - lo >= 15:
         F, X, Y, D, s_axis = F[lo:hi + 1], X[lo:hi + 1], Y[lo:hi + 1], D[lo:hi + 1], s_axis[lo:hi + 1]
     if len(F) < 15:
         return {"v": video_path.stem, "note": "減速区間が短い"}
 
-    dcoef = np.polyfit(s_axis, D, 1)
-    ppcm = np.polyval(dcoef, s_axis) / BALL_DIAM_CM
+    # スケール(px/cm): 径の傾きが有意なときだけパース補正(局所スケール)を使う。
+    # 有意でない傾きはノイズで、使うとμrが検出器依存になるため定数スケールにする。
+    dcoef, dcov = np.polyfit(s_axis, D, 1, cov=True)
+    slope_se = np.sqrt(max(dcov[0, 0], 1e-12))
+    t_slope = abs(dcoef[0]) / slope_se
+    if t_slope >= PERSPECTIVE_T_MIN:
+        ppcm = np.polyval(dcoef, s_axis) / BALL_DIAM_CM
+        persp = "局所"
+    else:
+        ppcm = np.full(len(s_axis), np.median(D) / BALL_DIAM_CM)
+        persp = "定数"
     dpx = np.hypot(np.diff(X), np.diff(Y))
     ppcm_mid = (ppcm[:-1] + ppcm[1:]) / 2
     s_cm = np.concatenate([[0.0], np.cumsum(dpx / ppcm_mid)])
@@ -168,7 +191,8 @@ def process(video_path, det_ai=None):
         "v": video_path.stem, "n": int(mask.sum()),
         "v0_kmh": v0 / 100 * 3.6, "a_ms": a / 100, "mu": a / 100 / G,
         "mu_err": perr[2] / 100 / G, "lin": linearity, "rms_mm": rms_mm,
-        "ppcm": f"{ppcm[0]:.0f}->{ppcm[-1]:.0f}", "diam_px": float(np.median(D)), "note": "OK",
+        "ppcm": f"{ppcm[0]:.0f}->{ppcm[-1]:.0f}", "diam_px": float(np.median(D)),
+        "persp": persp, "t_slope": float(t_slope), "note": "OK",
     }
 
 
