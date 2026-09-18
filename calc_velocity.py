@@ -42,7 +42,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-EFFECTIVE_FPS = 233  # detect_ball.py と同じ値を使用
+EFFECTIVE_FPS = 240  # 撮影メタデータ com.android.capture.fps=240 より確定(旧233は誤り)
 
 CSV_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\frames\detections")
 
