@@ -193,6 +193,9 @@ def main():
                          "打球では古典46%%に対しAI100%%と大幅に良好")
     ap.add_argument("--max-aspect", type=float, default=8.0,
                     help="streak検出で許す 長辺/短辺 の上限")
+    ap.add_argument("--readout-ms", type=float, default=0.0,
+                    help="ローリングシャッターの読み出し時間τ[ms]。行yの撮影時刻を τ·y/H 遅らせて補正。"
+                         "rs_calib.py で較正した値を与える(既定0=補正なし)。240fpsなら4.17ms未満")
     ap.add_argument("--scale", choices=["auto", "gravity", "ball"], default="auto",
                     help="px/cmの決め方。gravity=自由落下のy(t)から重力で較正"
                          "(検出器に依存せず、高速球でブラーの影響を受けない)。"
@@ -213,6 +216,7 @@ def main():
         print("エラー: 動画を開けません")
         sys.exit(1)
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fr_h = float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080.0   # ローリングシャッター補正用
     f0 = args.f_start if args.f_start is not None else 0
     f1 = args.f_end if args.f_end is not None else n - 1
 
@@ -259,7 +263,17 @@ def main():
     rmed = np.median(R[keep]) if keep.sum() >= 3 else rmed0
     ppcm = 2 * rmed / BALL_DIAM_CM
 
-    t = (F - F[0]) / args.fps
+    # ── ローリングシャッター補正 ──
+    # センサーは画面上の行から順に読み出すため、行 y の実撮影時刻は
+    #   t = n/fps + τ·(y/H)   (τ=1フレームの読み出し時間)
+    # だけ遅れる。縦方向に動く球では有効なフレーム間隔が伸縮し、加速度に偏りが出る
+    # (落下検証では抗力込みで+17%のうち、τ≈3-4msで半分程度を説明できる)。
+    # 横方向の運動では影響は小さい。τ は rs_calib.py 等で較正して与える(既定0=無効)。
+    if args.readout_ms > 0:
+        t = (F - F[0]) / args.fps + (args.readout_ms / 1000.0) * (Y / fr_h)
+        t = t - t[0]
+    else:
+        t = (F - F[0]) / args.fps
 
     # ── 重力によるスケール較正 ──
     # 飛球は自由落下中なので、y(t)の放物線フィットの2次係数が g[px/s^2] を与える。
