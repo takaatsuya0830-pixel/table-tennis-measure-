@@ -25,7 +25,7 @@ def imwrite(path: Path, img: np.ndarray) -> None:
 
 VIDEO_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論")
 DEFAULT_VIDEO = VIDEO_DIR / "PXL_20260521_141102911_h264.mp4"
-EFFECTIVE_FPS = 233  # 実効fps（30fps格納 × 8倍スロー ≒ 233fps）
+EFFECTIVE_FPS = 240  # 実効fps（30fps格納 × 8倍スロー = 240fps、capture.fpsメタデータと一致）
 OUTPUT_DIR = VIDEO_DIR / "frames"
 
 
