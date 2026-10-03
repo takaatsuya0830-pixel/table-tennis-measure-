@@ -41,8 +41,14 @@ BALL_DIAM_CM = 4.0             # 卓球ボール直径 40mm
 # 「等速フィット」は飛行中の平均速度を返すため、打球の初速を高速ほど過小評価する。
 BALL_MASS_KG = 0.0027
 AIR_DENSITY = 1.2              # kg/m^3
-DRAG_CD = 0.45                 # 球のCd(Re~1e4-1e5で0.4-0.5)
-G_CM = 981.0                   # cm/s^2
+DRAG_CD = 0.56                 # 2026-09-23 自由落下2本から実測(0.51, 0.62の平均。文献0.4-0.6)
+# 卓球ボールは軽いので空気の浮力と付加質量(押しのける空気の半分)が効く:
+#   g_eff = g(1-ρV/m)/(1+ρV/2m) = 9.59 m/s²,  抗力も 1/(1+ρV/2m) 倍になる
+# (9/23の落下検証で、この g_eff に対し -1.1%, -3.2% で一致)
+_BALL_V = 4.0 / 3.0 * np.pi * (BALL_DIAM_CM / 200.0) ** 3
+_ADDED = 1.0 + 0.5 * AIR_DENSITY * _BALL_V / BALL_MASS_KG
+G_CM = 981.0 * (1.0 - AIR_DENSITY * _BALL_V / BALL_MASS_KG) / _ADDED   # 実効重力 cm/s^2
+FOCAL_PX = 1250.0              # 1080p動画の焦点距離[px](Pixel主カメラ、水平画角~75°)。3D再構成の奥行きのみに効く
 VIDEO_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\videos")
 OUT_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\frames\hit_speed")
 
@@ -176,6 +182,173 @@ def drag_fit(t, s_cm, g_along_cm, k_cm):
             "resid_rms": rms, "s_pred": s_pred, "v_pred": v_pred}
 
 
+def track_bgsub(path, f0, f1, gate=90.0, max_lost=3):
+    """背景差分 + 予測近傍追跡で飛球を追う(暖色照明・白飛びでも使える)。
+
+    HSVの「白」判定は暖色光で球が黄色く写ると球の一部しか拾えず、
+    白飛びした打球では直径170pxの球を104pxと誤る(9/23動画)。背景差分なら色に依らない。
+    各フレームの候補blobを予測位置(前フレーム位置+速度)に最も近いものへ繋ぎ、
+    複数の軌跡(人・ラケットも含む)のうち画面上の移動量が最大のものを飛球とする。
+    直径 = minAreaRect の短辺(ブラーは運動方向にしか伸びないため)。
+    Returns F, X, Y, D (D=直径px), 画像幅, 画像高さ
+    """
+    cap = cv2.VideoCapture(str(path))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    samp = []
+    for f in np.linspace(0, n - 1, 40).astype(int):      # 球は各地点に一瞬しか居ない→中央値が背景
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(f))
+        ok, fr = cap.read()
+        if ok:
+            samp.append(fr)
+    bg = np.median(np.array(samp), axis=0).astype(np.uint8)
+
+    active, done = [], []
+    cap.set(cv2.CAP_PROP_POS_FRAMES, f0)
+    for f in range(f0, f1 + 1):
+        ok, fr = cap.read()
+        if not ok:
+            break
+        dg = cv2.cvtColor(cv2.absdiff(fr, bg), cv2.COLOR_BGR2GRAY)
+        m = (dg > 30).astype(np.uint8) * 255
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cands = []
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if a < 150:
+                continue
+            (_, _), (s1, s2), _ = cv2.minAreaRect(c)
+            mi, ma = min(s1, s2), max(s1, s2)
+            if not (12 < mi < 300) or ma / max(mi, 1) > 6 or a / (mi * ma) < 0.5:
+                continue
+            bx, by, bw, bh = cv2.boundingRect(c)
+            edge = bx <= 1 or by <= 1 or bx + bw >= W - 1 or by + bh >= H - 1   # 画面端で欠けた球
+            M = cv2.moments(c)
+            cands.append([M["m10"] / M["m00"], M["m01"] / M["m00"], mi, edge, False])
+        for tr in active:
+            lf, px, py = tr["rows"][-1][:3]
+            dt = f - lf
+            qx, qy = px + tr["vx"] * dt, py + tr["vy"] * dt
+            best = None
+            for c in cands:
+                if c[4]:
+                    continue
+                e = np.hypot(c[0] - qx, c[1] - qy)
+                if e < gate and (best is None or e < best[0]):
+                    best = (e, c)
+            if best is None:
+                tr["lost"] += 1
+                continue
+            c = best[1]; c[4] = True
+            tr["vx"], tr["vy"] = (c[0] - px) / dt, (c[1] - py) / dt
+            tr["lost"] = 0
+            tr["rows"].append((f, c[0], c[1], c[2], c[3]))
+        for c in cands:
+            if not c[4]:
+                active.append({"rows": [(f, c[0], c[1], c[2], c[3])], "vx": 0.0, "vy": 0.0, "lost": 0})
+        done += [t for t in active if t["lost"] > max_lost]
+        active = [t for t in active if t["lost"] <= max_lost]
+    cap.release()
+    done += active
+    done = [t for t in done if len(t["rows"]) >= 8]
+    if not done:
+        return None
+    best = max(done, key=lambda t: np.hypot(t["rows"][-1][1] - t["rows"][0][1],
+                                            t["rows"][-1][2] - t["rows"][0][2]))
+    R = np.array([r for r in best["rows"] if not r[4]], float)    # 端で欠けた球は除外
+    return R[:, 0], R[:, 1], R[:, 2], R[:, 3], W, H
+
+
+def fit_3d(t, x, y, d, focal_px, cx, cy):
+    """球の見かけ直径から3次元軌道を再構成し、抗力+重力の運動方程式でフィットする。
+
+    ピンホールカメラ:  Z = f·D/d,  X = (x-cx)·D/d,  Y = (y-cy)·D/d   (D=4cm)
+    横・縦の位置は f に依らず、奥行き Z だけが f に比例する。
+    → カメラに近づく/遠ざかる成分も含めた「本当の速さ」が1台のカメラで得られる。
+    モデル: dv/dt = g·ĝ − k|v|v。ĝ=重力の向き(カメラのピッチ・ロールで表す)。
+    g の大きさも自由にして、既知の g_eff と比べることで結果全体の検証に使う
+    (直径の定義やスケールが狂っていれば g が合わない)。
+    Returns dict: v0vec, v0, v_end, g, g_err, pitch, roll, rms[m]
+    """
+    from scipy.integrate import solve_ivp
+    from scipy.optimize import least_squares
+    # 直径のノイズを抑える: 1/d(∝奥行き)を時間の2次で平滑化(外れ値は3σで除去)
+    keep = np.ones(len(t), bool)
+    for _ in range(3):
+        c = np.polyfit(t[keep], 1 / d[keep], 2)
+        r = 1 / d - np.polyval(c, t)
+        nk = np.abs(r) < 3 * np.std(r[keep]) + 1e-12
+        if (nk == keep).all():
+            break
+        keep = nk
+    t, x, y = t[keep], x[keep], y[keep]
+    inv_d = np.polyval(c, t)
+    Dm = BALL_DIAM_CM / 100.0
+    P = np.column_stack([(x - cx) * Dm * inv_d, (y - cy) * Dm * inv_d, focal_px * Dm * inv_d])
+    k = AIR_DENSITY * DRAG_CD * np.pi * (Dm / 2) ** 2 / (2 * BALL_MASS_KG) / _ADDED
+
+    def gdir(th, ph):
+        return np.array([np.sin(ph) * np.cos(th), np.cos(ph) * np.cos(th), np.sin(th)])
+
+    def sim(p):
+        def rhs(_t, q):
+            v = q[3:]
+            return np.concatenate([v, p[6] * gdir(p[7], p[8]) - k * np.linalg.norm(v) * v])
+        z = solve_ivp(rhs, (t[0], t[-1]), p[:6], t_eval=t, rtol=1e-9, atol=1e-9)
+        return z.y[:3].T, z.y[3:].T
+
+    j = min(3, len(t) - 1)
+    x0 = np.concatenate([P[0], (P[j] - P[0]) / (t[j] - t[0]), [G_CM / 100.0, 0.0, 0.0]])
+    res = least_squares(lambda p: (sim(p)[0] - P).ravel(), x0=x0)
+    J = res.jac
+    cov = np.linalg.pinv(J.T @ J) * (res.fun @ res.fun / max(1, len(res.fun) - len(res.x)))
+    _, V = sim(res.x)
+    return {"v0vec": V[0], "v0": float(np.linalg.norm(V[0])), "v_end": float(np.linalg.norm(V[-1])),
+            "g": float(res.x[6]), "g_err": float(np.sqrt(cov[6, 6])),
+            "pitch": float(np.degrees(res.x[7])), "roll": float(np.degrees(res.x[8])),
+            "rms": float(np.sqrt(np.mean(res.fun ** 2))), "n": int(len(t)), "d_med": float(np.median(1 / inv_d))}
+
+
+def run_3d(args, path):
+    """--detector bgsub: 背景差分追跡 + 球径による3D再構成で打球初速を出す。"""
+    cap = cv2.VideoCapture(str(path))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); cap.release()
+    f0 = args.f_start if args.f_start is not None else 0
+    f1 = args.f_end if args.f_end is not None else n - 1
+    tr = track_bgsub(path, f0, f1)
+    if tr is None:
+        print("飛球の軌跡が見つかりません。--f-start/--f-end で飛行区間を指定してください。")
+        sys.exit(1)
+    F, X, Y, D, W, H = tr
+    if len(F) < 10:
+        print(f"追跡 {len(F)} 点で不足。")
+        sys.exit(1)
+    # ローリングシャッター: 行 y の撮影時刻は τ·y/H 遅れる(横長動画は縦に読み出す)
+    t = (F - F[0]) / args.fps + (args.readout_ms / 1000.0) * (Y - Y[0]) / H
+    r = fit_3d(t, X, Y, D, args.focal_px, W / 2.0, H / 2.0)
+    v = r["v0vec"]
+    g_dev = (r["g"] - G_CM / 100) / (G_CM / 100)
+    print(f"動画        : {path.name}")
+    print(f"検出方式    : 背景差分+予測追跡 → 球径で3D再構成 (f={args.focal_px:.0f}px, Cd={DRAG_CD}, τ={args.readout_ms}ms)")
+    print(f"追跡        : {len(F)} 点 (f{int(F[0])}-{int(F[-1])}) / フィット {r['n']} 点, 飛行 {t[-1]*1000:.0f} ms")
+    print(f"球の見かけ径: {D.min():.0f}〜{D.max():.0f}px (中央 {r['d_med']:.0f}px = カメラから約 {args.focal_px*BALL_DIAM_CM/r['d_med']:.0f}cm)")
+    print()
+    print(f"  ★ 打球初速 = {r['v0']:.2f} m/s = {r['v0']*3.6:.1f} km/h  (3次元・空気抵抗モデル)")
+    print(f"    内訳: 横 {v[0]*3.6:+.1f} / 縦 {v[1]*3.6:+.1f} / 奥行き {v[2]*3.6:+.1f} km/h"
+          f"  (奥行き成分 {abs(v[2])/r['v0']*100:.0f}%)")
+    print(f"    飛行終端 {r['v_end']*3.6:.1f} km/h,  位置残差 {r['rms']*1000:.1f} mm")
+    print(f"  検証: フィットした重力 g = {r['g']:.2f} ± {r['g_err']:.2f} m/s²"
+          f"  (理論 g_eff={G_CM/100:.2f} との差 {g_dev*100:+.1f}%)"
+          f"  カメラ傾き ピッチ{r['pitch']:+.0f}° ロール{r['roll']:+.0f}°")
+    if abs(g_dev) > 0.10:
+        print("    ⚠ 重力が10%超ずれています。球が近すぎてピンボケ/画面端で欠けている/"
+              "強い回転(マグヌス力)の可能性。速度も同程度ずれている恐れ")
+    else:
+        print("    → 重力が一致: スケール(球径)・時間(fps)・物理モデルが整合")
+
+
 def main():
     ap = argparse.ArgumentParser(description="打球速度 計測")
     ap.add_argument("--video", required=True, help="動画ファイル（VIDEO_DIR相対 or フルパス）")
@@ -187,10 +360,12 @@ def main():
     ap.add_argument("--min-area", type=int, default=100, help="検出最小面積px^2")
     ap.add_argument("--f-start", type=int, default=None)
     ap.add_argument("--f-end", type=int, default=None)
-    ap.add_argument("--detector", choices=["classical", "ai", "streak"], default="classical",
+    ap.add_argument("--detector", choices=["classical", "ai", "streak", "bgsub"], default="classical",
                     help="ボール検出方式。ai=学習済みYOLOv8(ONNX)。"
                          "streak=高速球むけ(運動ブラーで伸びた球を受け入れ、短辺を真の直径にする)。"
-                         "打球では古典46%%に対しAI100%%と大幅に良好")
+                         "bgsub=背景差分+予測追跡+球径による3D再構成(暖色照明・奥行き移動に強い、推奨)")
+    ap.add_argument("--focal-px", type=float, default=FOCAL_PX,
+                    help="bgsub の3D再構成に使う焦点距離[px]。奥行き成分にのみ効く(±30%%で初速±2%%程度)")
     ap.add_argument("--max-aspect", type=float, default=8.0,
                     help="streak検出で許す 長辺/短辺 の上限")
     ap.add_argument("--readout-ms", type=float, default=0.0,
@@ -210,6 +385,9 @@ def main():
     if not path.exists():
         print(f"エラー: {path} が見つかりません")
         sys.exit(1)
+    if args.detector == "bgsub":
+        run_3d(args, path)
+        return
 
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
@@ -290,7 +468,7 @@ def main():
             g_px = 2 * ycoef[0]                      # y下向き正 → 重力は正
             g_se = 2 * np.sqrt(max(ycov[0, 0], 0))
             if g_px > 0 and g_se < 0.5 * g_px:
-                ppcm_g = g_px / 981.0                # 981 cm/s^2
+                ppcm_g = g_px / G_CM                 # 実効重力 959 cm/s^2
                 g_rel_err = g_se / g_px
         except np.linalg.LinAlgError:
             pass
@@ -343,7 +521,7 @@ def main():
     # 等速フィット(v_ms)は飛行中の「平均速度」。打球の初速 v0 を得るには
     # 抗力 k·v² と重力の主軸成分で減速する運動方程式でフィットする。
     area_m2 = np.pi * (BALL_DIAM_CM / 200.0) ** 2
-    k_m = AIR_DENSITY * DRAG_CD * area_m2 / (2 * BALL_MASS_KG)   # [1/m]
+    k_m = AIR_DENSITY * DRAG_CD * area_m2 / (2 * BALL_MASS_KG) / _ADDED   # [1/m] 付加質量込み
     k_cm = k_m / 100.0                                              # [1/cm]
     g_along = G_CM * axis_u[1]      # 画像y下向き=重力方向。主軸のy成分が重力の寄与
     drag = None
