@@ -304,11 +304,86 @@ def fit_3d(t, x, y, d, focal_px, cx, cy):
     res = least_squares(lambda p: (sim(p)[0] - P).ravel(), x0=x0)
     J = res.jac
     cov = np.linalg.pinv(J.T @ J) * (res.fun @ res.fun / max(1, len(res.fun) - len(res.x)))
-    _, V = sim(res.x)
-    return {"v0vec": V[0], "v0": float(np.linalg.norm(V[0])), "v_end": float(np.linalg.norm(V[-1])),
+    Pf, V = sim(res.x)
+    # p0vec: (外れ値除去後の)最初の時刻における3D位置。fit_image の初期値に使う
+    return {"p0vec": Pf[0], "v0vec": V[0], "v0": float(np.linalg.norm(V[0])), "v_end": float(np.linalg.norm(V[-1])),
             "g": float(res.x[6]), "g_err": float(np.sqrt(cov[6, 6])),
             "pitch": float(np.degrees(res.x[7])), "roll": float(np.degrees(res.x[8])),
             "rms": float(np.sqrt(np.mean(res.fun ** 2))), "n": int(len(t)), "d_med": float(np.median(1 / inv_d))}
+
+
+def fit_image(t, x, y, d, focal_px, cx, cy, init=None, d_bias=0.0, fix_g=False):
+    """画像空間で直接フィットする(fit_3d の改良版)。
+
+    fit_3d は観測 d から Z=f·D/d を作ってから3D位置をフィットするため、
+    d の誤差(数%)が X,Y,Z すべてに相関して入り、x,y の高精度(~1px)を活かせない。
+    ここでは逆に、3D運動モデルを画像へ投影して観測と比べる:
+        x_pred = f·X/Z + cx,  y_pred = f·Y/Z + cy,  d_pred = f·D/Z + d_bias
+        残差 = ((x-x_pred)/σxy, (y-y_pred)/σxy, (d-d_pred)/σd)
+    σxy, σd は残差から推定して1回再フィットする(各チャンネルを正しい重みで使う)。
+    外れ値は soft_l1 ロスで抑える(しきい値で捨てない)。
+    d_bias: 直径の測り方の系統的な偏り[px](静止球の距離較正で求めたものを与える)。
+    fix_g : g の大きさを g_eff に固定する。速い球は飛行が短く(60km/hで~0.1s)落下が
+            ほとんど写らないため g が決まらず(合成データで±46%)、初速も道連れでぶれる。
+            その場合は g を既知として固定し、検証には使わない。
+    Returns fit_3d と同じキー + v0_err(初速の1σ, m/s), sig_xy, sig_d
+    """
+    from scipy.integrate import solve_ivp
+    from scipy.optimize import least_squares
+    Dm = BALL_DIAM_CM / 100.0
+    k = AIR_DENSITY * DRAG_CD * np.pi * (Dm / 2) ** 2 / (2 * BALL_MASS_KG) / _ADDED
+    if init is None:
+        init = fit_3d(t, x, y, d - d_bias, focal_px, cx, cy)
+
+    def gdir(th, ph):
+        return np.array([np.sin(ph) * np.cos(th), np.cos(ph) * np.cos(th), np.sin(th)])
+
+    def sim(p):
+        def rhs(_t, q):
+            v = q[3:]
+            return np.concatenate([v, p[6] * gdir(p[7], p[8]) - k * np.linalg.norm(v) * v])
+        z = solve_ivp(rhs, (t[0], t[-1]), p[:6], t_eval=t, rtol=1e-9, atol=1e-9)
+        return z.y[:3].T, z.y[3:].T
+
+    def project(p):
+        P, _ = sim(p)
+        Z = P[:, 2]
+        return focal_px * P[:, 0] / Z + cx, focal_px * P[:, 1] / Z + cy, focal_px * Dm / Z + d_bias
+
+    # 初期値: 3D法の解を t[0] の状態に戻す
+    G0 = G_CM / 100.0
+    full = (lambda q: np.concatenate([q[:6], [G0], q[6:]])) if fix_g else (lambda q: q)
+    p0 = np.concatenate([init["p0vec"], init["v0vec"],
+                         ([] if fix_g else [init["g"]]) + [np.radians(init["pitch"]), np.radians(init["roll"])]])
+    sig_xy, sig_d = 1.0, 3.0
+    for _ in range(2):
+        def res(p, sxy=sig_xy, sd=sig_d):
+            xp, yp, dp = project(full(p))
+            return np.concatenate([(x - xp) / sxy, (y - yp) / sxy, (d - dp) / sd])
+        r = least_squares(res, x0=p0, loss="soft_l1", f_scale=2.5)
+        p0 = r.x
+        xp, yp, dp = project(full(r.x))
+        rxy = np.concatenate([x - xp, y - yp]); rd = d - dp
+        # 残差のロバストな広がり(MAD)で σ を更新
+        sig_xy = max(1.4826 * np.median(np.abs(rxy - np.median(rxy))), 0.2)
+        sig_d = max(1.4826 * np.median(np.abs(rd - np.median(rd))), 0.2)
+    J = r.jac
+    n_obs = len(r.fun); dof = max(1, n_obs - len(r.x))
+    s2 = max(np.sum(r.fun ** 2) / dof, 1.0)       # 重みが楽観的なら共分散を膨らませる
+    cov = np.linalg.pinv(J.T @ J) * s2
+    pf = full(r.x)
+    P, V = sim(pf)
+    v0n = float(np.linalg.norm(V[0]))
+    grad = np.zeros(len(r.x)); grad[3:6] = V[0] / max(v0n, 1e-9)
+    v0_err = float(np.sqrt(max(grad @ cov @ grad, 0)))
+    Pm = np.column_stack([(x - cx) * Dm / (d - d_bias), (y - cy) * Dm / (d - d_bias),
+                          focal_px * Dm / (d - d_bias)])
+    return {"v0vec": V[0], "v0": v0n, "v0_err": v0_err, "v_end": float(np.linalg.norm(V[-1])),
+            "g": float(pf[6]), "g_err": 0.0 if fix_g else float(np.sqrt(cov[6, 6])), "g_fixed": fix_g,
+            "pitch": float(np.degrees(pf[7])), "roll": float(np.degrees(pf[8])),
+            "rms": float(np.sqrt(np.mean(np.sum((P - Pm) ** 2, 1)) / 3)),
+            "n": int(len(t)), "d_med": float(np.median(d)), "sig_xy": float(sig_xy), "sig_d": float(sig_d),
+            "p0vec": P[0]}
 
 
 def run_3d(args, path):
@@ -327,18 +402,34 @@ def run_3d(args, path):
         sys.exit(1)
     # ローリングシャッター: 行 y の撮影時刻は τ·y/H 遅れる(横長動画は縦に読み出す)
     t = (F - F[0]) / args.fps + (args.readout_ms / 1000.0) * (Y - Y[0]) / H
-    r = fit_3d(t, X, Y, D, args.focal_px, W / 2.0, H / 2.0)
+    r3 = fit_3d(t, X, Y, D - args.d_bias, args.focal_px, W / 2.0, H / 2.0)
+    r = r3 if args.fit == "3d" else fit_image(t, X, Y, D, args.focal_px, W / 2.0, H / 2.0,
+                                               init=r3, d_bias=args.d_bias, fix_g=args.fix_g)
     v = r["v0vec"]
     g_dev = (r["g"] - G_CM / 100) / (G_CM / 100)
     print(f"動画        : {path.name}")
-    print(f"検出方式    : 背景差分+予測追跡 → 球径で3D再構成 (f={args.focal_px:.0f}px, Cd={DRAG_CD}, τ={args.readout_ms}ms)")
+    _fname = "画像空間フィット" if args.fit == "image" else "3D位置フィット"
+    print(f"検出方式    : 背景差分+予測追跡 → 球径で3D再構成・{_fname}"
+          f" (f={args.focal_px:.0f}px, 径の偏り{args.d_bias:+.1f}px, Cd={DRAG_CD}, τ={args.readout_ms}ms)")
     print(f"追跡        : {len(F)} 点 (f{int(F[0])}-{int(F[-1])}) / フィット {r['n']} 点, 飛行 {t[-1]*1000:.0f} ms")
     print(f"球の見かけ径: {D.min():.0f}〜{D.max():.0f}px (中央 {r['d_med']:.0f}px = カメラから約 {args.focal_px*BALL_DIAM_CM/r['d_med']:.0f}cm)")
     print()
-    print(f"  ★ 打球初速 = {r['v0']:.2f} m/s = {r['v0']*3.6:.1f} km/h  (3次元・空気抵抗モデル)")
+    if "v0_err" in r:
+        print(f"  ★ 打球初速 = {r['v0']:.2f} ± {r['v0_err']:.2f} m/s = {r['v0']*3.6:.1f} ± {r['v0_err']*3.6:.1f} km/h"
+              f"  (3次元・空気抵抗モデル・画像空間フィット)")
+        print("    ※ ± は観測ノイズによる統計誤差のみ。焦点距離・直径の偏り・回転(マグヌス力)による"
+              "系統誤差は含まない(9/23の打球では重力のずれから見て数%)")
+        print(f"    観測ノイズ(推定): 位置 {r['sig_xy']:.2f}px, 直径 {r['sig_d']:.2f}px"
+              f"   / 参考: 3D位置フィットの初速 {r3['v0']*3.6:.1f} km/h, g={r3['g']:.2f}")
+    else:
+        print(f"  ★ 打球初速 = {r['v0']:.2f} m/s = {r['v0']*3.6:.1f} km/h  (3次元・空気抵抗モデル)")
     print(f"    内訳: 横 {v[0]*3.6:+.1f} / 縦 {v[1]*3.6:+.1f} / 奥行き {v[2]*3.6:+.1f} km/h"
           f"  (奥行き成分 {abs(v[2])/r['v0']*100:.0f}%)")
     print(f"    飛行終端 {r['v_end']*3.6:.1f} km/h,  位置残差 {r['rms']*1000:.1f} mm")
+    if r.get("g_fixed"):
+        print(f"  重力: g = g_eff = {G_CM/100:.2f} m/s² に固定(--fix-g)。重力による検証はなし"
+              f"  カメラ傾き ピッチ{r['pitch']:+.0f}° ロール{r['roll']:+.0f}°")
+        return
     print(f"  検証: フィットした重力 g = {r['g']:.2f} ± {r['g_err']:.2f} m/s²"
           f"  (理論 g_eff={G_CM/100:.2f} との差 {g_dev*100:+.1f}%)"
           f"  カメラ傾き ピッチ{r['pitch']:+.0f}° ロール{r['roll']:+.0f}°")
@@ -366,6 +457,14 @@ def main():
                          "bgsub=背景差分+予測追跡+球径による3D再構成(暖色照明・奥行き移動に強い、推奨)")
     ap.add_argument("--focal-px", type=float, default=FOCAL_PX,
                     help="bgsub の3D再構成に使う焦点距離[px]。奥行き成分にのみ効く(±30%%で初速±2%%程度)")
+    ap.add_argument("--fit", choices=["image", "3d"], default="image",
+                    help="bgsub のフィット方式。image=3D運動を画像に投影して(x,y,d)と比較(推奨)。"
+                         "3d=直径からZを出して3D位置をフィット(旧方式)")
+    ap.add_argument("--d-bias", type=float, default=0.0,
+                    help="直径の測り方の系統的な偏り[px]。静止球を既知距離に置いた d=f·D/Z+b の較正値 b")
+    ap.add_argument("--fix-g", action="store_true",
+                    help="重力の大きさを g_eff に固定(速い球むけ。飛行が短いと g が決まらず初速がぶれる)。"
+                         "この場合 g による検証はできない")
     ap.add_argument("--max-aspect", type=float, default=8.0,
                     help="streak検出で許す 長辺/短辺 の上限")
     ap.add_argument("--readout-ms", type=float, default=0.0,
