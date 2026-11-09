@@ -182,7 +182,35 @@ def drag_fit(t, s_cm, g_along_cm, k_cm):
             "resid_rms": rms, "s_pred": s_pred, "v_pred": v_pred}
 
 
-def track_bgsub(path, f0, f1, gate=90.0, max_lost=3):
+def bgsub_candidates(fr, bg):
+    """背景差分でボール候補を探す。Returns [(cx, cy, 直径px, 画面端で欠けているか), ...]
+
+    直径 = 差分マスクの minAreaRect 短辺。打球の追跡(track_bgsub)と静止球の較正
+    (calib_static.py)で同じ定義を使うための共通関数。定義を変えると較正値 b が無効になる。
+    """
+    H, W = fr.shape[:2]
+    dg = cv2.cvtColor(cv2.absdiff(fr, bg), cv2.COLOR_BGR2GRAY)
+    m = (dg > 30).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if a < 150:
+            continue
+        (_, _), (s1, s2), _ = cv2.minAreaRect(c)
+        mi, ma = min(s1, s2), max(s1, s2)
+        if not (12 < mi < 300) or ma / max(mi, 1) > 6 or a / (mi * ma) < 0.5:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        edge = bx <= 1 or by <= 1 or bx + bw >= W - 1 or by + bh >= H - 1   # 画面端で欠けた球
+        M = cv2.moments(c)
+        out.append((M["m10"] / M["m00"], M["m01"] / M["m00"], mi, edge))
+    return out
+
+
+def track_bgsub(path, f0, f1, gate=90.0, max_lost=3, gate_first=300.0):
     """背景差分 + 予測近傍追跡で飛球を追う(暖色照明・白飛びでも使える)。
 
     HSVの「白」判定は暖色光で球が黄色く写ると球の一部しか拾えず、
@@ -190,6 +218,9 @@ def track_bgsub(path, f0, f1, gate=90.0, max_lost=3):
     各フレームの候補blobを予測位置(前フレーム位置+速度)に最も近いものへ繋ぎ、
     複数の軌跡(人・ラケットも含む)のうち画面上の移動量が最大のものを飛球とする。
     直径 = minAreaRect の短辺(ブラーは運動方向にしか伸びないため)。
+    つなぐ範囲(gate): 速度がまだ分からない2点目は gate_first まで広げ、その後は
+    予測位置から max(gate, 0.6×1フレームの移動量) 以内。50km/h級の打球は1フレームで
+    100px以上進むため、固定の90pxでは追跡が始まらず前半を取りこぼしていた(10/20動画)。
     Returns F, X, Y, D (D=直径px), 画像幅, 画像高さ
     """
     cap = cv2.VideoCapture(str(path))
@@ -209,34 +240,21 @@ def track_bgsub(path, f0, f1, gate=90.0, max_lost=3):
         ok, fr = cap.read()
         if not ok:
             break
-        dg = cv2.cvtColor(cv2.absdiff(fr, bg), cv2.COLOR_BGR2GRAY)
-        m = (dg > 30).astype(np.uint8) * 255
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cands = []
-        for c in cnts:
-            a = cv2.contourArea(c)
-            if a < 150:
-                continue
-            (_, _), (s1, s2), _ = cv2.minAreaRect(c)
-            mi, ma = min(s1, s2), max(s1, s2)
-            if not (12 < mi < 300) or ma / max(mi, 1) > 6 or a / (mi * ma) < 0.5:
-                continue
-            bx, by, bw, bh = cv2.boundingRect(c)
-            edge = bx <= 1 or by <= 1 or bx + bw >= W - 1 or by + bh >= H - 1   # 画面端で欠けた球
-            M = cv2.moments(c)
-            cands.append([M["m10"] / M["m00"], M["m01"] / M["m00"], mi, edge, False])
+        cands = [[cx, cy, mi, edge, False] for cx, cy, mi, edge in bgsub_candidates(fr, bg)]
         for tr in active:
             lf, px, py = tr["rows"][-1][:3]
             dt = f - lf
             qx, qy = px + tr["vx"] * dt, py + tr["vy"] * dt
+            if len(tr["rows"]) == 1:
+                g_now = gate_first * dt
+            else:
+                g_now = max(gate, 0.6 * np.hypot(tr["vx"], tr["vy"]) * dt)
             best = None
             for c in cands:
                 if c[4]:
                     continue
                 e = np.hypot(c[0] - qx, c[1] - qy)
-                if e < gate and (best is None or e < best[0]):
+                if e < g_now and (best is None or e < best[0]):
                     best = (e, c)
             if best is None:
                 tr["lost"] += 1
@@ -255,10 +273,30 @@ def track_bgsub(path, f0, f1, gate=90.0, max_lost=3):
     done = [t for t in done if len(t["rows"]) >= 8]
     if not done:
         return None
-    best = max(done, key=lambda t: np.hypot(t["rows"][-1][1] - t["rows"][0][1],
-                                            t["rows"][-1][2] - t["rows"][0][2]))
+    # 飛球の選び方: 画面上を十分長く動いた軌跡(最長の半分以上)のうち、最も早いもの。
+    # 壁で跳ね返って戻ってくる球は打球より長く写ることがあり、「最長」で選ぶと
+    # 跳ね返りを打球と取り違える(10/20 041940482 で 178km/h という誤った値になった)。
+    disp = [np.hypot(t["rows"][-1][1] - t["rows"][0][1], t["rows"][-1][2] - t["rows"][0][2]) for t in done]
+    long_ = [t for t, dd in zip(done, disp) if dd >= 0.5 * max(disp)]
+    best = min(long_, key=lambda t: t["rows"][0][0])
     R = np.array([r for r in best["rows"] if not r[4]], float)    # 端で欠けた球は除外
+    if len(R) == 0:
+        return None
     return R[:, 0], R[:, 1], R[:, 2], R[:, 3], W, H
+
+
+def diameter_outlier_mask(D, win=7, tol=0.25):
+    """前後 win 点の中央値から tol(25%)以上、または全体の中央値から50%以上ずれた直径を外れ値とする。
+
+    球が下げ振りのおもり等と重なると直径が大きく、物の陰や画面の端で一部しか
+    写らないと小さく出る(10/20 040155468: 約60pxの中に101pxと13px)。
+    こうした点が数点あるだけで初期値が崩れ、フィットが発散した。
+    """
+    D = np.asarray(D, float)
+    h = win // 2
+    med = np.array([np.median(D[max(0, i - h):i + h + 1]) for i in range(len(D))])
+    gm = np.median(D)          # 端で数点まとまって小さい場合は近所の中央値も小さいので、全体の中央値でも判定
+    return (np.abs(D - med) <= tol * med) & (np.abs(D - gm) <= 0.5 * gm)
 
 
 def fit_3d(t, x, y, d, focal_px, cx, cy):
@@ -312,7 +350,7 @@ def fit_3d(t, x, y, d, focal_px, cx, cy):
             "rms": float(np.sqrt(np.mean(res.fun ** 2))), "n": int(len(t)), "d_med": float(np.median(1 / inv_d))}
 
 
-def fit_image(t, x, y, d, focal_px, cx, cy, init=None, d_bias=0.0, fix_g=False):
+def fit_image(t, x, y, d, focal_px, cx, cy, init=None, d_bias=0.0, fix_g=False, grav=None):
     """画像空間で直接フィットする(fit_3d の改良版)。
 
     fit_3d は観測 d から Z=f·D/d を作ってから3D位置をフィットするため、
@@ -326,7 +364,8 @@ def fit_image(t, x, y, d, focal_px, cx, cy, init=None, d_bias=0.0, fix_g=False):
     fix_g : g の大きさを g_eff に固定する。速い球は飛行が短く(60km/hで~0.1s)落下が
             ほとんど写らないため g が決まらず(合成データで±46%)、初速も道連れでぶれる。
             その場合は g を既知として固定し、検証には使わない。
-    Returns fit_3d と同じキー + v0_err(初速の1σ, m/s), sig_xy, sig_d
+    grav  : 下げ振り(plumb.gravity_constraint)から得た重力の向きの条件。None なら向きも推定。
+    Returns fit_3d と同じキー + v0_err(初速の1σ, m/s), sig_xy, sig_d, grav_mode
     """
     from scipy.integrate import solve_ivp
     from scipy.optimize import least_squares
@@ -338,31 +377,72 @@ def fit_image(t, x, y, d, focal_px, cx, cy, init=None, d_bias=0.0, fix_g=False):
     def gdir(th, ph):
         return np.array([np.sin(ph) * np.cos(th), np.cos(ph) * np.cos(th), np.sin(th)])
 
-    def sim(p):
-        def rhs(_t, q):
-            v = q[3:]
-            return np.concatenate([v, p[6] * gdir(p[7], p[8]) - k * np.linalg.norm(v) * v])
-        z = solve_ivp(rhs, (t[0], t[-1]), p[:6], t_eval=t, rtol=1e-9, atol=1e-9)
+    # 重力の向きの扱い(grav):
+    #   None            → カメラのピッチ・ロール(2角)を未知数として推定
+    #   ("plane", n)    → 下げ振り1本: 向きは法線 n の平面内。平面内の角度1つだけ推定
+    #   ("fixed", dvec) → 下げ振り2本: 向きは既知。角度は推定しない
+    # 速い球は飛行が短く向きがほとんど決まらないので、糸で向きを与えると安定する。
+    mode = "free" if grav is None else grav[0]
+    if mode == "plane":
+        nrm = np.asarray(grav[1], float); nrm = nrm / np.linalg.norm(nrm)
+        u0 = np.array([0.0, 1.0, 0.0]) - nrm[1] * nrm; u0 /= np.linalg.norm(u0)   # 平面内で画像の真下に最も近い向き
+        w0 = np.cross(nrm, u0)
+    if mode == "fixed":
+        dfix = np.asarray(grav[1], float); dfix = dfix / np.linalg.norm(dfix)
+    na = {"free": 2, "plane": 1, "fixed": 0}[mode]
+    G0 = G_CM / 100.0
+
+    def decode(q):
+        """未知数ベクトル → (初期状態6, gの大きさ, 重力の向き)"""
+        i = 6
+        g = G0 if fix_g else q[i]
+        i += 0 if fix_g else 1
+        if mode == "free":
+            dv = gdir(q[i], q[i + 1])
+        elif mode == "plane":
+            dv = np.cos(q[i]) * u0 + np.sin(q[i]) * w0
+        else:
+            dv = dfix
+        return q[:6], g, dv
+
+    def sim(q):
+        s0, g, dv = decode(q)
+        def rhs(_t, z):
+            v = z[3:]
+            return np.concatenate([v, g * dv - k * np.linalg.norm(v) * v])
+        z = solve_ivp(rhs, (t[0], t[-1]), s0, t_eval=t, rtol=1e-9, atol=1e-9)
         return z.y[:3].T, z.y[3:].T
 
-    def project(p):
-        P, _ = sim(p)
+    def project(q):
+        P, _ = sim(q)
         Z = P[:, 2]
         return focal_px * P[:, 0] / Z + cx, focal_px * P[:, 1] / Z + cy, focal_px * Dm / Z + d_bias
 
-    # 初期値: 3D法の解を t[0] の状態に戻す
-    G0 = G_CM / 100.0
-    full = (lambda q: np.concatenate([q[:6], [G0], q[6:]])) if fix_g else (lambda q: q)
+    # 初期値: 3D法の解。角度は ±45° に制限する(速い球で角度が暴走して初速が発散した: 10/20 040155468)
+    ANG = np.radians(45.0)
+    clipr = lambda a: float(np.clip(a, -0.95 * ANG, 0.95 * ANG))
+    d_init = gdir(np.radians(init["pitch"]), np.radians(init["roll"]))
+    if mode == "free":
+        ang0 = [clipr(np.radians(init["pitch"])), clipr(np.radians(init["roll"]))]
+    elif mode == "plane":
+        ang0 = [clipr(np.arctan2(d_init @ w0, d_init @ u0))]
+    else:
+        ang0 = []
     p0 = np.concatenate([init["p0vec"], init["v0vec"],
-                         ([] if fix_g else [init["g"]]) + [np.radians(init["pitch"]), np.radians(init["roll"])]])
+                         ([] if fix_g else [float(np.clip(init["g"], 3.0, 25.0))]) + ang0])
+    lo = np.full(len(p0), -np.inf); hi = np.full(len(p0), np.inf)
+    if na:
+        lo[-na:], hi[-na:] = -ANG, ANG
+    if not fix_g:
+        lo[6], hi[6] = 2.0, 30.0
     sig_xy, sig_d = 1.0, 3.0
     for _ in range(2):
-        def res(p, sxy=sig_xy, sd=sig_d):
-            xp, yp, dp = project(full(p))
+        def res(q, sxy=sig_xy, sd=sig_d):
+            xp, yp, dp = project(q)
             return np.concatenate([(x - xp) / sxy, (y - yp) / sxy, (d - dp) / sd])
-        r = least_squares(res, x0=p0, loss="soft_l1", f_scale=2.5)
+        r = least_squares(res, x0=p0, loss="soft_l1", f_scale=2.5, bounds=(lo, hi))
         p0 = r.x
-        xp, yp, dp = project(full(r.x))
+        xp, yp, dp = project(r.x)
         rxy = np.concatenate([x - xp, y - yp]); rd = d - dp
         # 残差のロバストな広がり(MAD)で σ を更新
         sig_xy = max(1.4826 * np.median(np.abs(rxy - np.median(rxy))), 0.2)
@@ -371,16 +451,17 @@ def fit_image(t, x, y, d, focal_px, cx, cy, init=None, d_bias=0.0, fix_g=False):
     n_obs = len(r.fun); dof = max(1, n_obs - len(r.x))
     s2 = max(np.sum(r.fun ** 2) / dof, 1.0)       # 重みが楽観的なら共分散を膨らませる
     cov = np.linalg.pinv(J.T @ J) * s2
-    pf = full(r.x)
-    P, V = sim(pf)
+    _, g_fit, dv = decode(r.x)
+    P, V = sim(r.x)
     v0n = float(np.linalg.norm(V[0]))
     grad = np.zeros(len(r.x)); grad[3:6] = V[0] / max(v0n, 1e-9)
     v0_err = float(np.sqrt(max(grad @ cov @ grad, 0)))
     Pm = np.column_stack([(x - cx) * Dm / (d - d_bias), (y - cy) * Dm / (d - d_bias),
                           focal_px * Dm / (d - d_bias)])
     return {"v0vec": V[0], "v0": v0n, "v0_err": v0_err, "v_end": float(np.linalg.norm(V[-1])),
-            "g": float(pf[6]), "g_err": 0.0 if fix_g else float(np.sqrt(cov[6, 6])), "g_fixed": fix_g,
-            "pitch": float(np.degrees(pf[7])), "roll": float(np.degrees(pf[8])),
+            "g": float(g_fit), "g_err": 0.0 if fix_g else float(np.sqrt(cov[6, 6])), "g_fixed": fix_g,
+            "pitch": float(np.degrees(np.arcsin(np.clip(dv[2], -1, 1)))),
+            "roll": float(np.degrees(np.arctan2(dv[0], dv[1]))), "grav_mode": mode,
             "rms": float(np.sqrt(np.mean(np.sum((P - Pm) ** 2, 1)) / 3)),
             "n": int(len(t)), "d_med": float(np.median(d)), "sig_xy": float(sig_xy), "sig_d": float(sig_d),
             "p0vec": P[0]}
@@ -397,21 +478,41 @@ def run_3d(args, path):
         print("飛球の軌跡が見つかりません。--f-start/--f-end で飛行区間を指定してください。")
         sys.exit(1)
     F, X, Y, D, W, H = tr
+    keep = diameter_outlier_mask(D)
+    n_drop = int((~keep).sum())
+    F, X, Y, D = F[keep], X[keep], Y[keep], D[keep]
     if len(F) < 10:
         print(f"追跡 {len(F)} 点で不足。")
         sys.exit(1)
     # ローリングシャッター: 行 y の撮影時刻は τ·y/H 遅れる(横長動画は縦に読み出す)
     t = (F - F[0]) / args.fps + (args.readout_ms / 1000.0) * (Y - Y[0]) / H
+    # 下げ振り(糸)から重力の向き
+    grav, plumb_msg = None, "使わない(--plumb none)"
+    if args.plumb != "none":
+        import plumb as pl
+        lines = pl.parse_manual(args.plumb) if args.plumb != "auto" else pl.find_plumb_lines(pl.sample_frames(path))
+        grav = pl.gravity_constraint(lines, args.focal_px, W / 2.0, H / 2.0)
+        if grav is None:
+            plumb_msg = "糸が見つからない → 向きも推定"
+        elif grav[0] == "fixed":
+            th, ph = pl.gravity_angles(grav[1])
+            plumb_msg = f"糸{len(lines)}本で向きを固定(ピッチ{th:+.1f}° ロール{ph:+.1f}°)"
+        else:
+            L = lines[0]
+            plumb_msg = (f"糸1本 x={(L[0]+L[2])/2:.0f}px(傾き{np.degrees(np.arctan2(L[2]-L[0], L[3]-L[1])):+.1f}°)"
+                         "で向きを1つに絞る(2本あれば完全に決まる)")
     r3 = fit_3d(t, X, Y, D - args.d_bias, args.focal_px, W / 2.0, H / 2.0)
     r = r3 if args.fit == "3d" else fit_image(t, X, Y, D, args.focal_px, W / 2.0, H / 2.0,
-                                               init=r3, d_bias=args.d_bias, fix_g=args.fix_g)
+                                               init=r3, d_bias=args.d_bias, fix_g=args.fix_g, grav=grav)
     v = r["v0vec"]
     g_dev = (r["g"] - G_CM / 100) / (G_CM / 100)
     print(f"動画        : {path.name}")
     _fname = "画像空間フィット" if args.fit == "image" else "3D位置フィット"
     print(f"検出方式    : 背景差分+予測追跡 → 球径で3D再構成・{_fname}"
           f" (f={args.focal_px:.0f}px, 径の偏り{args.d_bias:+.1f}px, Cd={DRAG_CD}, τ={args.readout_ms}ms)")
-    print(f"追跡        : {len(F)} 点 (f{int(F[0])}-{int(F[-1])}) / フィット {r['n']} 点, 飛行 {t[-1]*1000:.0f} ms")
+    print(f"追跡        : {len(F)} 点 (f{int(F[0])}-{int(F[-1])}) / フィット {r['n']} 点, 飛行 {t[-1]*1000:.0f} ms"
+          + (f"  (直径が外れた {n_drop} 点を除外)" if n_drop else ""))
+    print(f"重力の向き  : {plumb_msg}")
     print(f"球の見かけ径: {D.min():.0f}〜{D.max():.0f}px (中央 {r['d_med']:.0f}px = カメラから約 {args.focal_px*BALL_DIAM_CM/r['d_med']:.0f}cm)")
     print()
     if "v0_err" in r:
@@ -462,6 +563,9 @@ def main():
                          "3d=直径からZを出して3D位置をフィット(旧方式)")
     ap.add_argument("--d-bias", type=float, default=0.0,
                     help="直径の測り方の系統的な偏り[px]。静止球を既知距離に置いた d=f·D/Z+b の較正値 b")
+    ap.add_argument("--plumb", default="auto",
+                    help="下げ振り(おもり付きの糸)で重力の向きを決める。auto=動画から自動で探す、none=使わない、"
+                         "または糸の両端の座標 x1,y1,x2,y2 (2本なら ; で区切る)。左右の端に1本ずつあると向きが完全に決まる")
     ap.add_argument("--fix-g", action="store_true",
                     help="重力の大きさを g_eff に固定(速い球むけ。飛行が短いと g が決まらず初速がぶれる)。"
                          "この場合 g による検証はできない")
