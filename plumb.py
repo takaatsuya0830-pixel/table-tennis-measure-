@@ -185,6 +185,35 @@ def gravity_angles(d):
     return float(np.degrees(th)), float(np.degrees(ph))
 
 
+def focal_from_threads(lines, dist_l, dist_r, gap, W, H):
+    """間隔の分かった糸2本と、レンズからそれぞれの糸までの距離から焦点距離[px]を求める。
+
+    レンズ・左の糸・右の糸の三角形の3辺(dist_l, dist_r, gap)から、レンズで見た2本の糸の
+    間の角度 θ が決まる(余弦定理)。画面上では、レンズの高さの行(y=H/2)での糸の位置 xl, xr が
+    atan(xr/f) − atan(xl/f) = θ を満たすので、これを f について解く。
+    距離は水平に測ったもの(床に沿って、またはレンズの高さで)を想定。
+    2026-11-10: 間隔100cm・125cm/130cm で f≈1500 (それまでの仮定 1250)。
+    Returns (f, θ[度], xl, xr)。三角形が成り立たない/解がない場合は None。
+    """
+    from scipy.optimize import brentq
+    if len(lines) < 2:
+        return None
+    cosv = (dist_l ** 2 + dist_r ** 2 - gap ** 2) / (2 * dist_l * dist_r)
+    if not -1 < cosv < 1:
+        return None
+    th = np.arccos(cosv)
+    xs = []
+    for L in lines[:2]:
+        x1, y1, x2, y2 = L[:4]
+        xs.append(x1 + (x2 - x1) * (H / 2 - y1) / (y2 - y1) - W / 2)
+    xl, xr = sorted(xs)
+    fn = lambda f: np.arctan(xr / f) - np.arctan(xl / f) - th
+    if fn(50.0) < 0 or fn(1e5) > 0:
+        return None
+    f = brentq(fn, 50.0, 1e5)
+    return float(f), float(np.degrees(th)), float(xl), float(xr)
+
+
 def parse_manual(spec):
     """'x1,y1,x2,y2;x1,y1,x2,y2' → 線のリスト"""
     out = []
@@ -217,8 +246,11 @@ def main():
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
     ap = argparse.ArgumentParser(description="下げ振り(糸)の検出と重力の向き")
     ap.add_argument("--video", required=True)
-    ap.add_argument("--focal-px", type=float, default=1250.0)
+    ap.add_argument("--focal-px", type=float, default=1500.0, help="hit_speed.FOCAL_PX と同じ値")
     ap.add_argument("--save", default=None, help="検出結果を描いた画像の保存先")
+    ap.add_argument("--thread-dist", default=None,
+                    help="レンズから左の糸・右の糸までの距離[cm] (例: 125,130)。--thread-gap と合わせて焦点距離を求める")
+    ap.add_argument("--thread-gap", type=float, default=100.0, help="糸と糸の間隔[cm]")
     args = ap.parse_args()
     path = Path(args.video)
     if not path.is_absolute():
@@ -233,6 +265,17 @@ def main():
     for i, L in enumerate(lines):
         tilt = np.degrees(np.arctan2(L[2] - L[0], L[3] - L[1]))
         print(f"糸{i+1}: ({L[0]:.1f},{L[1]:.0f})→({L[2]:.1f},{L[3]:.0f})  画面上の傾き {tilt:+.2f}°  長さ {L[3]-L[1]:.0f}px  コントラスト {L[4]:.0f}")
+    if args.thread_dist:
+        dl, dr = [float(t) for t in args.thread_dist.split(",")]
+        r = focal_from_threads(lines, dl, dr, args.thread_gap, W, H)
+        if r is None:
+            print("焦点距離を求められませんでした(糸が2本見つからない、または距離と間隔の組み合わせが三角形にならない)")
+        else:
+            f, th, xl, xr = r
+            print(f"焦点距離: f = {f:.0f}px  (2本の糸の間の角度 {th:.1f}°、レンズの高さでの糸の位置 {xl:+.0f}px / {xr:+.0f}px)")
+            print(f"  距離の測り間違い1cmで f は約{abs(f - focal_from_threads(lines, dl, dr + 1, args.thread_gap, W, H)[0]):.0f}px 変わります"
+                  f"(初速への影響はごく小さい)")
+            args.focal_px = f
     c = gravity_constraint(lines, args.focal_px, W / 2, H / 2)
     if c[0] == "fixed":
         th, ph = gravity_angles(c[1])

@@ -48,7 +48,10 @@ DRAG_CD = 0.56                 # 2026-09-23 自由落下2本から実測(0.51, 0
 _BALL_V = 4.0 / 3.0 * np.pi * (BALL_DIAM_CM / 200.0) ** 3
 _ADDED = 1.0 + 0.5 * AIR_DENSITY * _BALL_V / BALL_MASS_KG
 G_CM = 981.0 * (1.0 - AIR_DENSITY * _BALL_V / BALL_MASS_KG) / _ADDED   # 実効重力 cm/s^2
-FOCAL_PX = 1250.0              # 1080p動画の焦点距離[px](Pixel主カメラ、水平画角~75°)。3D再構成の奥行きのみに効く
+# 1080p動画の焦点距離[px]。3D再構成の奥行きにだけ効き、初速への影響は小さい(1250→1500で0〜3%)。
+# 2026-11-10: 間隔1mの糸2本とレンズからの距離(125cm, 130cm)から 1500 と求めた(plumb.py --thread-dist)。
+# 以前の仮定値は1250。
+FOCAL_PX = 1500.0
 VIDEO_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\videos")
 OUT_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\frames\hit_speed")
 
@@ -210,7 +213,7 @@ def bgsub_candidates(fr, bg):
     return out
 
 
-def track_bgsub(path, f0, f1, gate=90.0, max_lost=3, gate_first=300.0):
+def track_bgsub(path, f0, f1, gate=90.0, max_lost=3, gate_first=300.0, select="hit"):
     """背景差分 + 予測近傍追跡で飛球を追う(暖色照明・白飛びでも使える)。
 
     HSVの「白」判定は暖色光で球が黄色く写ると球の一部しか拾えず、
@@ -221,6 +224,8 @@ def track_bgsub(path, f0, f1, gate=90.0, max_lost=3, gate_first=300.0):
     つなぐ範囲(gate): 速度がまだ分からない2点目は gate_first まで広げ、その後は
     予測位置から max(gate, 0.6×1フレームの移動量) 以内。50km/h級の打球は1フレームで
     100px以上進むため、固定の90pxでは追跡が始まらず前半を取りこぼしていた(10/20動画)。
+    select="fall" のときは、下向きに最も大きく動いた軌跡(縦の移動が横の2倍以上)を選ぶ
+    (落下の動画。カーテンの揺れなどの長い軌跡を打球の選び方で拾ってしまうため)。
     Returns F, X, Y, D (D=直径px), 画像幅, 画像高さ
     """
     cap = cv2.VideoCapture(str(path))
@@ -276,9 +281,16 @@ def track_bgsub(path, f0, f1, gate=90.0, max_lost=3, gate_first=300.0):
     # 飛球の選び方: 画面上を十分長く動いた軌跡(最長の半分以上)のうち、最も早いもの。
     # 壁で跳ね返って戻ってくる球は打球より長く写ることがあり、「最長」で選ぶと
     # 跳ね返りを打球と取り違える(10/20 041940482 で 178km/h という誤った値になった)。
-    disp = [np.hypot(t["rows"][-1][1] - t["rows"][0][1], t["rows"][-1][2] - t["rows"][0][2]) for t in done]
-    long_ = [t for t, dd in zip(done, disp) if dd >= 0.5 * max(disp)]
-    best = min(long_, key=lambda t: t["rows"][0][0])
+    if select == "fall":
+        drops = [(t["rows"][-1][2] - t["rows"][0][2], t) for t in done
+                 if t["rows"][-1][2] - t["rows"][0][2] > 2 * abs(t["rows"][-1][1] - t["rows"][0][1])]
+        if not drops:
+            return None
+        best = max(drops, key=lambda q: q[0])[1]
+    else:
+        disp = [np.hypot(t["rows"][-1][1] - t["rows"][0][1], t["rows"][-1][2] - t["rows"][0][2]) for t in done]
+        long_ = [t for t, dd in zip(done, disp) if dd >= 0.5 * max(disp)]
+        best = min(long_, key=lambda t: t["rows"][0][0])
     R = np.array([r for r in best["rows"] if not r[4]], float)    # 端で欠けた球は除外
     if len(R) == 0:
         return None
