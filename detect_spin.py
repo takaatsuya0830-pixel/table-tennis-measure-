@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ─── 定数 ────────────────────────────────────────────────────
-EFFECTIVE_FPS = 233
+EFFECTIVE_FPS = 240  # 撮影メタデータ com.android.capture.fps=240 より確定(旧233は誤り)
 
 OUTPUT_DIR = Path(r"c:\Users\bi23043\Documents\4年前期\卒論\frames")
 # ─────────────────────────────────────────────────────────────
@@ -180,8 +180,10 @@ def main():
     parser.add_argument("--fps", type=float, default=float(EFFECTIVE_FPS))
     parser.add_argument("--start", type=int, default=0, help="開始フレーム番号")
     parser.add_argument("--count", type=int, default=None, help="処理フレーム数")
-    parser.add_argument("--min-r", type=int, default=40, help="ボール最小半径px")
-    parser.add_argument("--max-r", type=int, default=80, help="ボール最大半径px")
+    # ⚠ 半径既定値は必ず実測に合わせること。俯瞰撮影(2026-06-01)では実際のボールが
+    #   半径22〜32pxしかなく、既定40-80が背景の固定物を誤検出して結果が全て無効になった。
+    parser.add_argument("--min-r", type=int, default=40, help="ボール最小半径px(必ず実測に合わせる)")
+    parser.add_argument("--max-r", type=int, default=80, help="ボール最大半径px(必ず実測に合わせる)")
     parser.add_argument("--param2", type=int, default=30, help="Hough param2")
     parser.add_argument("--max-jump", type=float, default=150.0,
                         help="前フレームからの最大追従距離px")
