@@ -479,6 +479,33 @@ def fit_image(t, x, y, d, focal_px, cx, cy, init=None, d_bias=0.0, fix_g=False, 
             "p0vec": P[0]}
 
 
+def print_thread_gate(args, t, F, X, Y, D, lines, W, H):
+    """糸2本の間を通る時間から出した速さ(1m÷時間)を表示する。plumb.thread_gate を参照。"""
+    if len(lines) < 2:
+        return
+    import plumb as pl
+    depths = None
+    if args.thread_dist:
+        dl, dr = [float(v) for v in args.thread_dist.split(",")]
+        depths = pl.thread_depths(lines, dl, dr, args.focal_px, W, H)
+    g = pl.thread_gate(t, F, X, Y, D, lines, args.focal_px, W, H, gap_cm=args.thread_gap, depths=depths)
+    if isinstance(g, str):
+        print(f"  糸の間の速さ: 求められず({g})")
+        return
+    off = max(g["offset"], key=abs)
+    zt = "、".join(f"{z:.0f}" for z in g["z_thread"]) + ("(画面上の間隔から見積もり。--thread-dist で実測値を)" if g["depth_estimated"] else "")
+    print(f"  糸の間の速さ: 糸1→糸2 {g['frames']:.1f}コマ = {g['dt']*1000:.1f} ms → "
+          f"{args.thread_gap:.0f}cm÷時間 = {g['v_gate']*3.6:.1f} km/h  (糸と糸の間の平均の横の速さ)")
+    print(f"    球の奥行き {g['z_ball'][0]:.0f}→{g['z_ball'][1]:.0f}cm / 糸の奥行き {zt}cm"
+          f" → 球の大きさから出した同じ区間の横の速さ {g['v_ball']*3.6:.1f} km/h"
+          f" (差 {100*(g['v_gate']/g['v_ball']-1):+.1f}%)")
+    if abs(off) <= 5:
+        print(f"    → 糸のすぐ手前を通った(ずれ{off:+.0f}cm): 球の大きさを使わない答え合わせとして使える")
+    else:
+        print(f"    ⚠ 糸から{abs(off):.0f}cm{'手前' if off < 0 else '奥'}を通った: {args.thread_gap:.0f}cm÷時間 は"
+              f"{'速く' if off < 0 else '遅く'}出る。答え合わせには使えない")
+
+
 def run_3d(args, path):
     """--detector bgsub: 背景差分追跡 + 球径による3D再構成で打球初速を出す。"""
     cap = cv2.VideoCapture(str(path))
@@ -499,9 +526,9 @@ def run_3d(args, path):
     # ローリングシャッター: 行 y の撮影時刻は τ·y/H 遅れる(横長動画は縦に読み出す)
     t = (F - F[0]) / args.fps + (args.readout_ms / 1000.0) * (Y - Y[0]) / H
     # 下げ振り(糸)から重力の向き
-    grav, plumb_msg = None, "使わない(--plumb none)"
+    grav, plumb_msg, lines = None, "使わない(--plumb none)", []
+    import plumb as pl
     if args.plumb != "none":
-        import plumb as pl
         lines = pl.parse_manual(args.plumb) if args.plumb != "auto" else pl.find_plumb_lines(pl.sample_frames(path))
         grav = pl.gravity_constraint(lines, args.focal_px, W / 2.0, H / 2.0)
         if grav is None:
@@ -539,6 +566,7 @@ def run_3d(args, path):
     print(f"    内訳: 横 {v[0]*3.6:+.1f} / 縦 {v[1]*3.6:+.1f} / 奥行き {v[2]*3.6:+.1f} km/h"
           f"  (奥行き成分 {abs(v[2])/r['v0']*100:.0f}%)")
     print(f"    飛行終端 {r['v_end']*3.6:.1f} km/h,  位置残差 {r['rms']*1000:.1f} mm")
+    print_thread_gate(args, t, F, X, Y, D, lines, W, H)
     if r.get("g_fixed"):
         print(f"  重力: g = g_eff = {G_CM/100:.2f} m/s² に固定(--fix-g)。重力による検証はなし"
               f"  カメラ傾き ピッチ{r['pitch']:+.0f}° ロール{r['roll']:+.0f}°")
@@ -578,6 +606,11 @@ def main():
     ap.add_argument("--plumb", default="auto",
                     help="下げ振り(おもり付きの糸)で重力の向きを決める。auto=動画から自動で探す、none=使わない、"
                          "または糸の両端の座標 x1,y1,x2,y2 (2本なら ; で区切る)。左右の端に1本ずつあると向きが完全に決まる")
+    ap.add_argument("--thread-gap", type=float, default=100.0,
+                    help="糸2本の間隔[cm]。ボールが糸から糸まで進む時間で割って速さを出す(糸の間の速さ)")
+    ap.add_argument("--thread-dist", default=None,
+                    help="レンズから左の糸・右の糸までの距離[cm] (例: 125,130)。糸の奥行きを正確にし、"
+                         "ボールが糸のすぐ手前を通ったかの判定に使う")
     ap.add_argument("--fix-g", action="store_true",
                     help="重力の大きさを g_eff に固定(速い球むけ。飛行が短いと g が決まらず初速がぶれる)。"
                          "この場合 g による検証はできない")

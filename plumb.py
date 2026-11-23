@@ -214,6 +214,64 @@ def focal_from_threads(lines, dist_l, dist_r, gap, W, H):
     return float(f), float(np.degrees(th)), float(xl), float(xr)
 
 
+def thread_depths(lines, dist_l, dist_r, f, W, H):
+    """レンズから左右の糸までの距離[cm]を、奥行き(光軸方向)に直す。Returns (Z左, Z右)"""
+    out = []
+    for L, dist in zip(sorted(lines[:2], key=lambda L: L[0]), (dist_l, dist_r)):
+        x1, y1, x2, y2 = L[:4]
+        x = x1 + (x2 - x1) * (H / 2 - y1) / (y2 - y1) - W / 2
+        out.append(dist * np.cos(np.arctan(x / f)))
+    return tuple(out)
+
+
+def thread_gate(t, F, X, Y, D, lines, f, W, H, gap_cm=100.0, depths=None, ball_cm=4.0):
+    """糸2本を「光の門」のように使って速さを出す(2026-11-10)。
+
+    ボールが1本目の糸から2本目の糸まで進むのにかかった時間で、間隔(1m)を割る。
+    球の大きさを使わない、別の物差しによる速さになる。ただし正しいのは、ボールが糸の
+    すぐ手前(同じ奥行き)を通ったときだけ。カメラ寄りを通ると、糸と糸の間の見かけの幅が
+    1mより短くなり、速く出すぎる(11/09 の打球で7〜25cm手前 → 8〜27%速い)。
+    そこで、球の直径から出したボールの奥行きと糸の奥行きを比べて、使えるかを判定する。
+    出る速さは糸と糸の間の「平均の横の速さ」で、打った直後の速さより数%遅い。
+
+    t: 各点の時刻[s](読み出し補正込み)。depths: 糸の奥行き(Z左, Z右)[cm]、None なら
+    2本が同じ奥行きにあるとして画面上の間隔から見積もる。
+    Returns dict、または横切らないときは理由の文字列。
+    """
+    if len(lines) < 2:
+        return "糸が2本見つからない"
+    Ls = sorted(lines[:2], key=lambda L: L[0])
+    cross = []
+    for L in Ls:
+        x1, y1, x2, y2 = L[:4]
+        xt = x1 + (x2 - x1) * (Y - y1) / (y2 - y1)
+        s = X - xt
+        idx = [i for i in range(len(s) - 1) if np.sign(s[i]) != np.sign(s[i + 1]) and F[i + 1] - F[i] <= 5]
+        if not idx:
+            return "ボールが糸を2本とも横切っていない(画面の途中から入った/途中で消えた)"
+        i = idx[0]
+        a = s[i] / (s[i] - s[i + 1])
+        cross.append({"t": t[i] + a * (t[i + 1] - t[i]), "F": F[i] + a * (F[i + 1] - F[i]),
+                      "x": xt[i] + a * (xt[i + 1] - xt[i]),
+                      "d": float(np.median(D[max(i - 3, 0):i + 5]))})
+    A, B = cross
+    dt = abs(B["t"] - A["t"])
+    if dt <= 0:
+        return "時間が求められない"
+    dx_px = abs(B["x"] - A["x"])
+    if depths is None:
+        zt = f * gap_cm / dx_px
+        depths = (zt, zt); est = True
+    else:
+        est = False
+    zb = [f * ball_cm / A["d"], f * ball_cm / B["d"]]        # A=左の糸、B=右の糸(飛ぶ向きによらない)
+    off = [zb[0] - depths[0], zb[1] - depths[1]]
+    v_gate = gap_cm / dt / 100.0                                  # m/s
+    v_ball = dx_px * np.mean(zb) / f / dt / 100.0                 # 球の奥行きでの視線の間隔 / 時間
+    return {"frames": abs(B["F"] - A["F"]), "dt": dt, "v_gate": v_gate, "v_ball": v_ball,
+            "z_ball": zb, "z_thread": list(depths), "offset": off, "depth_estimated": est}
+
+
 def parse_manual(spec):
     """'x1,y1,x2,y2;x1,y1,x2,y2' → 線のリスト"""
     out = []
